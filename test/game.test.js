@@ -740,7 +740,8 @@ test('Voting: a tie, or Skip on top (alone or tied), eliminates nobody', () => {
   assert.equal(skip.day.verdict.outcome, 'skip');
   const tied = dayOne();
   dayVote(tied, { ana: 'skip', cal: 'skip', ben: 'cal', dev: 'cal' });
-  assert.equal(tied.day.verdict.outcome, 'skip');
+  assert.equal(tied.day.verdict.outcome, 'tie'); // Skip tied for most is reported as a tie
+  assert.match(tied.day.verdict.text, /tie/);
   assert.equal(G.aliveIds(tied).length, 6);
   const none = dayOne();
   dayVote(none, {});
@@ -827,12 +828,13 @@ test('Win checks: the wolves win at parity; winners are the whole team, dead or 
 });
 
 test('Win checks: the village wins when no killer wolf is alive; a Minion alone can\'t keep the wolves alive', () => {
-  const s = startGame({ ana: 'werewolf', ben: 'minion', cal: 'witch', dev: 'villager', eve: 'cupid' });
+  // Six players: with five, a Werewolf plus a Minion would already be too many wolves.
+  const s = startGame({ ana: 'werewolf', ben: 'minion', cal: 'witch', dev: 'villager', eve: 'cupid', fay: 'villager' });
   playNight(s, [['eve', { targets: ['cal', 'dev'] }], ['ana', { target: 'cal' }], ['cal', { heal: null, poison: 'ana' }]]);
-  // Alive: the Minion and Cupid. One against one, but no killer wolf.
-  assert.deepEqual(G.aliveIds(s), ['ben', 'eve']);
+  // Alive: the Minion, Cupid and a villager. The Minion is still on the board, but no killer wolf.
+  assert.deepEqual(G.aliveIds(s), ['ben', 'eve', 'fay']);
   assert.equal(s.winner.team, 'village');
-  assert.deepEqual(s.winner.winners, ['cal', 'dev', 'eve']);
+  assert.deepEqual(s.winner.winners, ['cal', 'dev', 'eve', 'fay']);
 });
 
 test('Win checks: nobody left alive is a Village win', () => {

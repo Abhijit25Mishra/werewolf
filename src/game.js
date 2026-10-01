@@ -718,12 +718,13 @@ function closeVote(state, now) {
   if (top === 0) {
     outcome = 'none';
     text = 'Nobody voted, so nobody is eliminated.';
-  } else if (leaders.includes('skip')) {
+  } else if (leaders.length > 1) {
+    // A tie for most votes, with or without Skip among the leaders.
+    outcome = 'tie';
+    text = "It's a tie, so nobody is eliminated.";
+  } else if (leaders[0] === 'skip') {
     outcome = 'skip';
     text = 'Skip has the most votes, so nobody is eliminated.';
-  } else if (leaders.length > 1) {
-    outcome = 'tie';
-    text = 'A tie, so nobody is eliminated.';
   } else {
     const p = state.players[leaders[0]];
     if (p.role === 'prince' && !p.flags.princeUsed) {

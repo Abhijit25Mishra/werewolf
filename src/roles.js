@@ -153,7 +153,11 @@ function validateDeck(roles, playerCount) {
   if (killers < 1) errors.push('Add at least one werewolf');
   if ((counts.apprentice || 0) > 0 && (counts.seer || 0) < 1) errors.push('An Apprentice Seer needs a Seer');
   const wolfTeam = ROLE_IDS.filter((id) => teamOf(id) === 'wolves').reduce((s, id) => s + (counts[id] || 0), 0);
-  if (total > 0 && wolfTeam * 2 >= total) errors.push('Too many wolves for this many players');
+  // With 5+ players the wolf team must stay short of parity even after one night kill, so
+  // every real game reaches at least one day vote. Tiny dev games (MIN_PLAYERS below 5) only
+  // need fewer wolves than everyone else.
+  const limit = total >= MIN_PLAYERS ? total - 1 : total;
+  if (total > 0 && wolfTeam * 2 >= limit) errors.push('Too many wolves for this many players');
   return errors;
 }
 
