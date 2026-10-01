@@ -162,7 +162,7 @@ The win check runs at dawn and after each verdict. A queued Hunter's shot is tak
 ### Setup and dealing
 
 - 5 to 20 players. An environment variable `MIN_PLAYERS` may lower the minimum for development only.
-- The deck comes from the role setup (section 4): in auto mode, a balanced deck built from the allowed roles; in manual mode, the host's counts. It must equal the player count, respect every role's limit (an Apprentice Seer needs a Seer), contain at least one killer wolf, and give the wolf team fewer players than everyone else.
+- The deck comes from the role setup (section 4): in auto mode, a balanced deck built from the allowed roles; in manual mode, the host's counts. It must equal the player count, respect every role's limit (an Apprentice Seer needs a Seer), contain at least one killer wolf, and, with 5 or more players, keep the wolf team small enough that one night kill can't give them parity, so every game reaches a vote.
 - Shuffle with a crypto-quality random source and deal in join order.
 - The list of roles in play, with counts, is public. Who holds which role is secret.
 
@@ -583,7 +583,7 @@ Use `node:test`, a seeded random source, and a helper that builds a game with fi
 | Voting | Plurality eliminates; a tie, or Skip on top, eliminates nobody |
 | Pack choice | Locks only when all living killer wolves agree; a forced lock uses the plurality with a seeded tie-break |
 | Win checks | Wolves win at parity; the village wins when no killer wolf is alive, including when nobody is left; a Minion alone can't keep the wolves alive |
-| Setup validation | Roles must sum to the player count, respect every role's limit, include a killer wolf and a Seer for any Apprentice Seer, and give the wolf team fewer players than everyone else |
+| Setup validation | Roles must sum to the player count, respect every role's limit, include a killer wolf and a Seer for any Apprentice Seer, and keep the wolf team short of parity even after one night kill |
 | Auto balance | For every player count from 5 to 20 and random allowed-role pools, auto mode returns a legal deck inside the target range; when none fits, the closest is flagged with suggested roles |
 | Reveal modes | Each reveal mode (role, day only, team, werewolf or not, none) shows exactly what it promises for night and day deaths, and everything at game over |
 | First night | With firstNightKill off, the pack gets no kill on night 1 and only meets |
