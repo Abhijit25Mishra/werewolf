@@ -29,6 +29,7 @@ The server (`server.js`, `src/`) and the client (`public/`) both implement exact
 | `RATE_LIMITED` | More than 10 events a second |
 | `SERVER_FULL` | 200 rooms already |
 | `BAD_REQUEST` | Malformed payload |
+| `RETRY` | The room is moving between server instances (a restart or deploy) or the store is briefly unreachable. Nothing changed; reconnect if disconnected, then send the same event again after a moment |
 
 ## HTTP
 
@@ -65,7 +66,7 @@ type RoleInfo = {
 | `room:join` | `{ code, name }` | Anyone | `{ code, playerId, token }` |
 | `room:resume` | `{ code, playerId, token }` | Anyone | none |
 | `room:reclaim` | `{ code, name }` | Anyone | `{ requestId }`, then later a `reclaim:result` event |
-| `room:leave` | `{}` | Seated player | none |
+| `room:leave` | `{}` | Seated player | none. Lobby: the seat is removed. In a game: the seat is kept and marked `left`, and its token stays valid, so `room:resume` brings the player back |
 | `lobby:ready` | `{ ready: boolean }` | Seated player, lobby | none |
 | `lobby:settings` | `{ patch: Partial<Settings> }` | Host, lobby | none |
 | `lobby:shuffle` | `{}` | Host, lobby, auto mode | none |
@@ -102,7 +103,19 @@ Night action payloads:
 | `seat:invalid` | `{}` |
 | `kicked` | `{ reason: string }` |
 | `reclaim:result` | `{ ok: true, code, playerId, token }` or `{ ok: false, reason: string }` |
-| `server:shutdown` | `{ message: string }` |
+| `server:shutdown` | `{ message: string }`. Sent only when games can't survive the restart (no durable store configured) |
+| `server:restarting` | `{ message: string, reconnectInMs: number }`. The server is restarting or handing rooms to a newer instance, and games will survive. The client keeps its seat, shows the reconnecting banner, and calls `socket.connect()` after `reconnectInMs` (then keeps retrying with backoff). Also sent, followed by a disconnect, when a handshake arrives for a room still owned by the old instance during a deploy |
+
+## Leaving and rejoining
+
+- `room:leave` during a game keeps the seat (marked `left`, token still valid). The client keeps the saved seat, flags it as left, stops sending it in the handshake `auth`, and shows "Rejoin <CODE> as <name>" on Home.
+- Rejoin sends `room:resume` with the saved seat. The server clears `left`, binds the socket and sends `state`; the client clears the flag.
+- A left seat counts as offline: joining with its name answers `NAME_TAKEN_OFFLINE`, and `room:reclaim` works for it from another device.
+- Play again still drops players who are `left` at that moment.
+
+## Surviving restarts
+
+Rooms are snapshotted to a store (Render Key Value via `REDIS_URL` in production; a local file store or an in-memory store in development and tests) and restored when a player of that room reconnects. Seat tokens are stored hashed. On restore, every game deadline is shifted by the downtime, so players get back the time they had. During a deploy the old and new instances overlap; a per-room lease makes sure only one instance runs a room, and the old instance hands its rooms over (flush, release leases, `server:restarting`, disconnect) once it sees a newer instance or receives `SIGTERM`.
 
 ## Snapshot
 
@@ -249,7 +262,17 @@ createServer({
   sweepMs?: number;        // cleanup sweep interval, default 5 min
   keepAliveMs?: number;    // default 150000; self-ping runs only when RENDER_EXTERNAL_URL is set
   rng?: () => number;      // seeded random source for tests; production uses crypto
-}) => { httpServer, io, rooms, listen(port) => Promise<number>, close() => Promise<void> }
+  store?: Store | false;   // snapshot store (src/store.js). Tests pass one createMemoryStore() to two servers.
+                           // Omitted: a private memory store that dies with the server (not durable).
+                           // false: no persistence. Run directly, server.js uses Redis (REDIS_URL) or the file store.
+  instanceId?: string;     // default RENDER_INSTANCE_ID or a random id; owns leases and deploy:latest
+}) => { httpServer, io, rooms, listen(port) => Promise<number>, close() => Promise<void>,
+        shutdown() => Promise<void>, handover() => Promise<void>, store, instanceId }
 // rooms: the live room store (Map code -> room) for test inspection only.
-// close(): stops the keep-alive, the sweep and every room timer, and closes io and httpServer.
+// close(): stops the keep-alive, the sweep, the lease and deploy timers and every room timer, writes the
+//   rooms still in memory and releases their leases, and closes io and httpServer.
+// shutdown(): the SIGTERM path. Durable store: hand rooms over (server:restarting), then close.
+//   Otherwise: server:shutdown, then close.
+// Also accepted, for tests: leaseMs, leaseRenewMs, deployPollMs, handoverDelayMs, saveDebounceMs,
+//   saveMaxDelayMs, roomTtlMs (defaults 15 s, 5 s, 3 s, 10 s, 1 s, 5 s, 6 h).
 ```

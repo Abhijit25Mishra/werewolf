@@ -69,9 +69,12 @@ function savedSeat() {
   const s = store.get(SEAT_KEY, null);
   return s && s.code && s.playerId && s.token ? s : null;
 }
+// After leaving a game the seat stays saved, flagged `left`, and is not sent in the handshake
+// (PROTOCOL: Leaving and rejoining). Home then offers "Rejoin <CODE> as <name>".
+const handshakeSeat = () => { const s = savedSeat(); return s && !s.left ? { code: s.code, playerId: s.playerId, token: s.token } : null; };
 let mockSeat = null;
 function saveSeat(seat) {
-  const s = { code: seat.code, playerId: seat.playerId, token: seat.token, name: seat.name || ui.home.name };
+  const s = { code: seat.code, playerId: seat.playerId, token: seat.token, name: seat.name || ui.home.name, left: !!seat.left };
   if (MOCK) mockSeat = s; else store.set(SEAT_KEY, s);
 }
 function forgetSeat() { if (MOCK) mockSeat = null; else store.del(SEAT_KEY); }
@@ -100,8 +103,10 @@ const ui = {
   sticky: {},          // the same reveals toggled on by a double-tap or a screen reader
   pick: [],            // current tile selection for the task on screen
   pickKey: '',
-  witchMode: 'heal',
-  witch: { heal: null, poison: null },
+  witch: { heal: null, poison: null },   // the Witch's choice in the private panel
+  cupid: [],                             // Cupid's pair in the private panel
+  peekOpen: false,                       // Peek toggled open (auto-hides)
+  privNote: '',                          // status line inside the private panel
   pendingVote: null,
   death: null,         // cause shown by the full-screen death moment
   busy: {},            // in-flight actions, to disable double taps
@@ -318,17 +323,28 @@ async function connect() {
     return;
   }
   state.conn = 'connecting';
-  socket = window.io({ auth: (cb) => cb(savedSeat() || {}) });
+  socket = window.io({ auth: (cb) => cb(handshakeSeat() || {}) });
   socket.on('connect', () => {
     clearTimeout(offlineTimer);
+    stopReconnect();
+    state.restarting = false;
     state.conn = 'online';
     state.everOnline = true;
     render();
   });
-  socket.on('disconnect', () => {
+  socket.on('disconnect', (reason) => {
     // Wait a moment before showing the banner, so a deliberate reconnect does not flash it.
     clearTimeout(offlineTimer);
-    offlineTimer = setTimeout(() => { state.conn = 'offline'; render(); }, 1200);
+    offlineTimer = setTimeout(() => { state.conn = 'offline'; render(); }, state.restarting ? 0 : 1200);
+    // After a server-side disconnect Socket.IO does not retry by itself.
+    if (reason === 'io server disconnect' && !reconnectTimer) scheduleReconnect(1000);
+  });
+  socket.on('server:restarting', (msg) => {
+    state.restarting = true;
+    state.conn = 'offline';
+    reconnectDelay = 1000;
+    scheduleReconnect(Math.max(0, Number(msg?.reconnectInMs) || 1000));
+    render();
   });
   socket.on('connect_error', () => {
     clearTimeout(offlineTimer);
@@ -336,11 +352,12 @@ async function connect() {
   });
   socket.on('state', onState);
   socket.on('seat:invalid', () => {
+    const old = savedSeat();
     forgetSeat();
     state.snap = null;
     state.away = false;
     ui.resuming = false;
-    ui.notice = { title: 'That game has ended', text: 'Your saved seat is no longer in a room. Create a room or join one with its code.' };
+    ui.notice = { title: 'Your saved seat has expired', text: `Your seat${old?.code ? ` in ${old.code}` : ''} isn’t valid any more: the room closed, or the seat moved to another phone. Create a room or join one with its code.` };
     render();
   });
   socket.on('kicked', (msg) => {
@@ -364,6 +381,37 @@ async function connect() {
     ui.notice = { title: 'The server is restarting', text: msg?.message || 'This game has ended. Create a new room in a minute.' };
     render();
   });
+}
+
+let reconnectTimer = null;
+let reconnectDelay = 1000;
+function stopReconnect() { clearTimeout(reconnectTimer); reconnectTimer = null; reconnectDelay = 1000; }
+function scheduleReconnect(delay) {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (!socket || socket.connected) return;
+    socket.connect();
+    reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+    scheduleReconnect(reconnectDelay);
+  }, delay);
+}
+
+// The server answers RETRY while it is busy restoring or handing over a room: wait about 2 s and try again.
+async function emitRetry(event, payload) {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const res = await emit(event, payload);
+    if (res.code !== 'RETRY') {
+      if (ui.retrying) { ui.retrying = false; render(); }
+      return res;
+    }
+    if (!ui.retrying) toast('The server is updating. Trying again in a moment…', 'i-clock');
+    ui.retrying = true;
+    render();
+    await sleep(2000);
+  }
+  ui.retrying = false;
+  return { ok: false, code: 'RETRY', error: 'The server is still updating. Try again in a minute.' };
 }
 
 function emit(event, payload = {}) {
@@ -404,7 +452,7 @@ function onReclaimResult(res) {
     ui.reclaim = null;
     ui.notice = null;
     toast('The host gave you your seat back.', 'i-check');
-    emit('room:resume', { code: res.code, playerId: res.playerId, token: res.token }).then((r) => {
+    emitRetry('room:resume', { code: res.code, playerId: res.playerId, token: res.token }).then((r) => {
       if (!r.ok) showError(r);
     });
   } else {
@@ -424,6 +472,8 @@ function onState(snap) {
   ui.notice = null;
   ui.reclaim = null;
   ui.resuming = false;
+  // "Confirmed tonight" only lasts for the current night (a new game reuses round numbers).
+  if (snap.game?.phase !== 'night') { if (MOCK) mockNightDone = ''; else store.del(NIGHT_KEY); }
   if (snap.room.code) {
     const seat = savedSeat();
     if (seat && seat.code !== snap.room.code) saveSeat({ ...seat, code: snap.room.code });
@@ -455,7 +505,7 @@ function noticeChanges(prev, next) {
     chime('night');
     narrate(`Night ${b.round} falls over the village.`);
     // Never speak the task itself: a screen reader on speaker would give the role away.
-    announce(`Night ${b.round}. Your task is on screen.`);
+    announce(`Night ${b.round}. Pick a player, then confirm.`);
   }
   if (b.phase === 'day' && stageChanged && a) {
     const stage = b.day?.stage;
@@ -522,7 +572,7 @@ function taskKey() {
   if (!g) return '';
   if (g.phase === 'night') {
     const t = g.night?.task;
-    return `n:${g.round}:${g.me?.alive}:${t?.kind}:${t?.wolf?.slot ?? ''}:${t?.witch?.waiting ?? ''}`;
+    return `n:${g.round}:${g.me?.alive}:${t?.kind}`;
   }
   return g.phase === 'day' ? `d:${g.round}:${g.day?.stage}` : g.phase;
 }
@@ -534,14 +584,14 @@ function syncPick() {
   ui.pickKey = k;
   ui.pick = [];
   ui.witch = { heal: null, poison: null };
-  ui.witchMode = 'heal';
+  ui.cupid = [];
   ui.pendingVote = null;
   const g = state.snap?.game;
   const t = g?.night?.task;
   const sub = t?.submitted;
   if (sub && typeof sub === 'object') {
-    if (sub.target) ui.pick = [sub.target];
-    if (Array.isArray(sub.targets)) ui.pick = sub.targets.slice(0, 2);
+    if (sub.target && LIVE_KINDS.includes(t.kind)) ui.pick = [sub.target];
+    if (Array.isArray(sub.targets)) ui.cupid = sub.targets.slice(0, 2);
     if (t.kind === 'witch') ui.witch = { heal: sub.heal ?? null, poison: sub.poison ?? null };
   }
   if (g?.phase === 'night' && g.me && !g.me.alive && g.ghost?.guess) ui.pick = [g.ghost.guess];
@@ -573,6 +623,9 @@ function render() {
     ui.screenKey = key;
     ui.hold = {};
     ui.sticky = {};
+    ui.peekOpen = false;
+    ui.privNote = '';
+    clearTimeout(peekTimer);
     if (ui.sheet !== 'menu') ui.sheet = null;
     if (ui.dialog && !ui.dialog.keep) ui.dialog = null;
   }
@@ -584,7 +637,8 @@ function render() {
     window.scrollTo(0, 0);
     // Move focus to the new screen's heading for screen readers, but not on first load.
     if (renderedBefore && (!document.activeElement || document.activeElement === document.body)) {
-      document.querySelector('#main h1, #main h2')?.focus({ preventScroll: true });
+      // In a game, focus lands on the phase title ("Night 2"), never on anything role-specific.
+      (document.querySelector('.phase-title') || document.querySelector('#main h1, #main h2'))?.focus({ preventScroll: true });
     }
   }
   tick();
@@ -597,7 +651,7 @@ function viewApp(key) {
   const dialog = viewDialog();
   const overlay = viewOverlay();
   modalNow = !!(String(sheet) || String(dialog) || String(overlay));
-  return html`${showBanner() ? viewBanner() : ''}${viewScreen(key)}${sheet}${dialog}${overlay}${viewPeekCard()}`;
+  return html`${showBanner() ? viewBanner() : ''}${viewScreen(key)}${viewPrivatePanel()}${sheet}${dialog}${overlay}${viewPeekCard()}`;
 }
 
 function viewScreen(key) {
@@ -617,15 +671,15 @@ function viewScreen(key) {
 const screen = (key, name, body) => html`<div class="screen screen-enter" data-key="screen:${key}" data-screen="${name}" data-testid="screen-${name}" ${modalNow ? raw('inert') : ''}><a class="skip-link" href="#main">Skip to content</a>${body}</div>`;
 const actionbar = (inner, note = '') => html`<div class="actionbar" data-testid="actionbar"><div class="actionbar-inner">${inner}${note ? html`<p class="actionbar-note" data-testid="actionbar-note">${note}</p>` : ''}</div></div>`;
 const isOpen = (kind) => !!(ui.hold[kind] || ui.sticky[kind]);
-const peeking = () => isOpen('eye');
+const peeking = () => !!(ui.hold.eye || ui.peekOpen);
 
 function showBanner() {
   if (MOCK) return !!ui.forceBanner;
   if (state.conn === 'online') return false;
-  return !!(state.snap || savedSeat()) && (state.everOnline || state.conn === 'offline');
+  return !!(state.snap || handshakeSeat()) && (state.everOnline || state.conn === 'offline' || state.restarting);
 }
 
-const viewBanner = () => html`<div class="banner" data-key="banner" role="status" data-testid="reconnect-banner">${ico('i-wifi-off', 'ico-sm')}<span>Reconnecting to the game</span><span class="banner-dots" aria-hidden="true"><i></i><i></i><i></i></span></div>`;
+const viewBanner = () => html`<div class="banner" data-key="banner" role="status" data-testid="reconnect-banner">${ico(state.restarting ? 'i-refresh' : 'i-wifi-off', 'ico-sm')}<span>${state.restarting ? 'Updating the server… reconnecting' : 'Reconnecting to the game'}</span><span class="banner-dots" aria-hidden="true"><i></i><i></i><i></i></span></div>`;
 
 /* ---------- Header, timer and tiles ---------- */
 
@@ -688,7 +742,7 @@ function viewTopbar() {
     <div class="tools${me ? '' : ' tools-2'}">
       ${me ? html`<button type="button" class="tool" data-hold="myrole" data-testid="my-role-btn" aria-pressed="${isOpen('myrole')}" aria-label="My role. Press and hold to see it">${ico('i-id')}<span>My role</span></button>` : ''}
       <button type="button" class="tool" data-act="sheet" data-arg="roles" data-testid="roles-btn" aria-label="Roles in this game">${ico('i-cards')}<span>Roles</span></button>
-      ${me ? html`<button type="button" class="tool" data-hold="eye" data-testid="eye-btn" data-holding="${peeking()}" aria-pressed="${peeking()}" aria-label="Peek. Press and hold to see your private marks">${ico(peeking() ? 'i-eye' : 'i-eye-off')}<span>Peek</span></button>` : ''}
+      ${me ? html`<button type="button" class="tool" data-hold="eye" data-testid="eye-btn" data-holding="${peeking()}" aria-pressed="${peeking()}" aria-label="Peek. Tap to show your private marks${g.phase === 'night' ? ' and panel' : ''}; it hides itself">${ico(peeking() ? 'i-eye' : 'i-eye-off')}<span>Peek</span></button>` : ''}
       <button type="button" class="icon-btn" data-act="sheet" data-arg="menu" data-testid="menu-btn" aria-label="Menu">${ico('i-menu')}</button>
     </div>
   </div></header>`;
@@ -791,8 +845,8 @@ function viewHome() {
       <div class="info-line">${ico('i-info')}<div><p class="h3">${ui.notice.title}</p><p class="muted">${ui.notice.text}</p></div></div></div>` : ''}
     ${rejoin ? html`<div class="rejoin" data-testid="rejoin">
       ${avatar(seat.name || '?')}
-      <div class="rejoin-text"><p class="rejoin-title">Rejoin ${seat.code} as ${seat.name || 'your seat'}</p><p class="small muted">Your seat is saved on this phone.</p></div>
-      <button type="button" class="btn btn-primary btn-sm" data-act="rejoin" data-testid="rejoin-btn" ${ui.busy['room:resume'] ? raw('disabled') : ''}>Rejoin</button>
+      <div class="rejoin-text"><p class="rejoin-title" translate="no">Rejoin ${seat.code} as ${seat.name || 'your seat'}</p><p class="small muted">${seat.left ? 'You left the game. You can rejoin until it ends.' : 'Your seat is saved on this phone.'}</p></div>
+      <button type="button" class="btn btn-primary btn-sm" data-act="rejoin" data-testid="rejoin-btn" ${ui.busy['room:resume'] ? raw('disabled') : ''}>${ui.busy['room:resume'] ? 'Rejoining…' : 'Rejoin'}</button>
     </div>` : ''}
     <form class="panel home-card" data-form="home" novalidate>
       <div class="field">
@@ -811,7 +865,7 @@ function viewHome() {
         ${err.code ? html`<p class="error" id="code-error" data-testid="code-error">${ico('i-alert')}${err.code}</p>` : ''}
       </div>
     </form>
-    <p class="home-foot">${state.conn === 'offline' && !MOCK ? 'Waiting for the game server…' : 'Friends join by code, link or QR code.'}</p>
+    <p class="home-foot" data-testid="home-foot">${ui.retrying ? 'The server is updating. Trying again in a moment…' : state.conn === 'offline' && !MOCK ? 'Waiting for the game server…' : 'Friends join by code, link or QR code.'}</p>
   </main>`;
   return screen(ui.screenKey, 'home', body);
 }
@@ -1126,28 +1180,29 @@ function viewReveal() {
 }
 
 /* ---------- Night ---------- */
+// Without Peek, every living player's night looks the same: one headline, one tile grid,
+// one Confirm and one Done screen, with the same timing, sound and buzz. Role-specific text,
+// results and the real choices of the Witch, Cupid and a disagreeing pack live in the private
+// panel that Peek opens, which hides itself after a few seconds.
 
-const TASK_NOTE = {
-  cupid: 'You may pick yourself. Lovers die together.',
-  wolf: 'Hold Peek to see the pack’s picks. The kill locks when you all agree.',
-  meet: 'No kill tonight. Hold Peek to see your pack, then confirm.',
-  seer: 'Your answer appears straight away. Hold to read it.',
-  sorceress: 'Your answer appears straight away. Hold to read it.',
-  doctor: 'They survive the night if the wolves or poison come for them.',
-  witch: 'Hold Peek to see who was attacked. Heal, poison, both or neither.',
-  decoy: 'Pick anyone. Your guess appears in the end-of-game recap.',
-  ghost: 'Just for fun. Your guesses are scored at the end.',
-};
+const LIVE_KINDS = ['seer', 'sorceress', 'doctor', 'decoy', 'wolf'];   // the visible pick is the real one
+const NIGHT_KEY = 'ww.night';
+let mockNightDone = '';
+const nightKey = () => { const s = state.snap; return s?.game ? `${s.room.code}:${s.game.round}` : ''; };
+const localNightDone = () => { const k = nightKey(); return !!k && (MOCK ? mockNightDone : store.get(NIGHT_KEY, '')) === k; };
+function setLocalNightDone() { const k = nightKey(); if (MOCK) mockNightDone = k; else store.set(NIGHT_KEY, k); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function taskPickable(t, p) {
-  if (!t) return false;
-  if (t.kind === 'witch') {
-    if (t.witch?.waiting) return false;
-    if (ui.witchMode === 'heal') return !!t.witch?.canHeal && (t.witch.victims || []).includes(p.id);
-    return !!t.witch?.canPoison && (t.targets || []).includes(p.id);
-  }
-  if (t.kind === 'meet') return false;
-  return (t.targets || []).includes(p.id);
+// Done on screen: the server says so, this phone confirmed tonight, or a wolf already sent a pick.
+function visiblyDone(t) {
+  if (!t || t.done || localNightDone()) return true;
+  return t.kind === 'wolf' && !!t.submitted?.target;
+}
+
+// The visible grid never offers yourself: only a Doctor could pick themselves, and that would show.
+function visiblePickable(t, p) {
+  if (!t || !p.alive || p.id === state.snap.room.you) return false;
+  return LIVE_KINDS.includes(t.kind) ? (t.targets || []).includes(p.id) : true;
 }
 
 function viewNight() {
@@ -1155,84 +1210,58 @@ function viewNight() {
   const t = g.night?.task || null;
   let body;
   if (!g.me.alive) body = viewGhostNight(g, t);
-  else if (!t || t.done) body = viewNightDone(g, t);
-  else body = viewTask(g, t);
+  else if (visiblyDone(t)) body = viewNightDone(g);
+  else body = viewNightPick(g, t);
   return screen(ui.screenKey, 'night', html`${viewTopbar()}${body}`);
 }
 
-function viewTask(g, t) {
-  const kind = t.kind;
-  const w = t.wolf;
-  const witch = kind === 'witch' ? t.witch || {} : null;
-  const locked = new Set(w?.locked || []);
-  const pickers = {};
+// Private hints on the grid while Peek is open (pack picks, the attacked player, why a tile won't pick).
+function nightPeekBadges(g, t, p) {
+  if (!peeking() || !t) return [];
   const you = state.snap.room.you;
-  for (const [wolf, target] of Object.entries(w?.picks || {})) (pickers[target] = pickers[target] || []).push(wolf === you ? 'you' : nameOf(wolf));
-  const tiles = g.players.map((p) => {
-    const badges = [];
-    if (peeking()) {
-      if (pickers[p.id]) badges.push(badge(`Pick: ${listJoin(pickers[p.id])}`.replace(/^Pick: you$/, 'Your pick'), 'accent', 'r-werewolf'));
-      if (locked.has(p.id)) badges.push(badge('Victim', 'wolf', 'i-lock'));
-      if (witch && (witch.victims || []).includes(p.id)) badges.push(badge('Attacked', 'wolf', 'r-werewolf'));
-    }
-    if (witch && ui.witch.heal === p.id) badges.push(badge('Heal', 'good', 'i-plus'));
-    if (witch && ui.witch.poison === p.id) badges.push(badge('Poison', 'wolf', 'r-witch'));
-    const selected = witch ? (ui.witchMode === 'heal' ? ui.witch.heal : ui.witch.poison) === p.id : ui.pick.includes(p.id);
-    if (peeking() && p.alive && !taskPickable(t, p) && p.id !== you && !inList(g.me?.knows?.pack, p)) badges.push(badge('Not tonight', '', 'i-lock'));
-    // Tasks with nothing to pick show plain tiles, so the grid does not look switched off.
-    if (kind === 'meet' || witch?.waiting) return viewTile(g, p, { badges });
-    return viewTile(g, p, { act: 'pick', pickable: taskPickable(t, p), selected, badges });
-  });
-  const need = t.choose === 2 ? 2 : 1;
-  const sent = kind === 'wolf' && t.submitted?.target;
-  let label = 'Confirm';
-  let ready = ui.pick.length >= need;
-  if (kind === 'meet') ready = true;
-  if (witch) { ready = !witch.waiting; label = witch.waiting ? 'Waiting for the pack' : 'Confirm'; }
-  else if (!ready) label = need === 2 ? 'Pick two players' : 'Pick a player';
-  if (sent && ui.pick[0] === t.submitted.target) ready = false;
-  const slots = w?.slots || 1;
-  const note = witch && !witch.waiting && !ui.witch.heal && !ui.witch.poison ? 'Nothing picked means no potion tonight.'
-    : '';
-  return html`<main class="main" id="main" data-testid="task" data-kind="${kind}">
+  const out = [];
+  const pickers = Object.entries(t.wolf?.picks || {}).filter(([, target]) => target === p.id).map(([wolf]) => (wolf === you ? 'you' : nameOf(wolf)));
+  if (pickers.length) out.push(badge(pickers.length === 1 && pickers[0] === 'you' ? 'Your pick' : `Pick: ${listJoin(pickers)}`, 'accent', 'r-werewolf'));
+  if ((t.wolf?.locked || []).includes(p.id)) out.push(badge('Victim', 'wolf', 'i-lock'));
+  if ((t.witch?.victims || []).includes(p.id)) out.push(badge('Attacked', 'wolf', 'r-werewolf'));
+  if (p.alive && p.id !== you && !visiblePickable(t, p) && !inList(g.me?.knows?.pack, p)) out.push(badge('Not tonight', '', 'i-lock'));
+  return out;
+}
+
+function viewNightPick(g, t) {
+  const tiles = g.players.map((p) => viewTile(g, p, { act: 'pick', pickable: visiblePickable(t, p), selected: ui.pick[0] === p.id, badges: nightPeekBadges(g, t, p) }));
+  const ready = !!ui.pick[0] && !ui.busy.night;
+  return html`<main class="main" id="main" data-testid="task">
     <div class="task-head">
-      <h2 class="task-prompt" tabindex="-1" data-testid="task-prompt">${t.prompt}</h2>
-      <p class="task-note">${TASK_NOTE[kind] || ''}</p>
+      <h2 class="task-prompt" data-testid="task-prompt">Pick a player, then confirm</h2>
+      <p class="task-note">Everyone picks someone. Tap Peek to see in private what your pick does tonight.</p>
     </div>
-    ${kind === 'wolf' && slots > 1 ? html`<span class="tag wolf-slot" data-testid="wolf-slot">Victim ${Math.min(slots, locked.size + 1)} of ${slots}</span>` : ''}
-    ${witch && !witch.waiting ? html`<div class="witch-tabs">${seg('witchMode', [['heal', 'Heal'], ['poison', 'Poison']], ui.witchMode, 'witch-mode', 'Potion')}</div>` : ''}
-    <div class="tiles" role="${kind === 'meet' || witch?.waiting ? 'list' : 'group'}" aria-label="Players" data-testid="player-grid">${tiles}</div>
+    <div class="tiles" role="group" aria-label="Players" data-testid="player-grid">${tiles}</div>
   </main>
-  ${actionbar(html`<button type="button" class="btn btn-primary btn-block btn-big" data-act="confirm" data-testid="confirm-btn" ${ready && !ui.busy['game:night-action'] ? '' : raw('disabled')}>${label}</button>`, note)}`;
+  ${actionbar(html`<button type="button" class="btn btn-primary btn-block btn-big" data-act="confirm" data-testid="confirm-btn" ${ready ? '' : raw('disabled')}>${ui.pick[0] ? 'Confirm' : 'Pick a player'}</button>`)}`;
 }
 
-function resultLine(g, t) {
-  if (!t) return { text: 'Nothing to report tonight.', tone: '' };
-  const sub = t.submitted || {};
-  if (t.result?.text) return { text: t.result.text, tone: t.result.wolf || t.result.seer ? 'wolf' : 'good' };
-  switch (t.kind) {
-    case 'cupid': return { text: sub.targets ? `You linked ${listJoin(sub.targets.map(nameOf))}.` : 'You made no link.', tone: '' };
-    case 'wolf': return { text: t.wolf?.locked?.length ? `The pack chose ${listJoin(t.wolf.locked.map(nameOf))}.` : 'The pack made no kill.', tone: 'wolf' };
-    case 'meet': return { text: 'You met your pack.', tone: '' };
-    case 'doctor': return { text: sub.target ? `You are protecting ${nameOf(sub.target)}.` : 'You protected nobody.', tone: 'good' };
-    case 'witch': {
-      const parts = [];
-      if (sub.heal) parts.push(`you healed ${nameOf(sub.heal)}`);
-      if (sub.poison) parts.push(`you poisoned ${nameOf(sub.poison)}`);
-      return { text: parts.length ? `Tonight ${listJoin(parts)}.` : 'You used no potion tonight.', tone: '' };
-    }
-    case 'decoy': return { text: sub.target ? `You suspect ${nameOf(sub.target)}.` : 'You suspect nobody yet.', tone: '' };
-    default: return { text: sub.target ? `You picked ${nameOf(sub.target)}.` : 'Nothing to report tonight.', tone: '' };
-  }
-}
-
-// The same held-down row for every role, so a glance cannot tell a Seer from a Villager.
-function secretRow(kind, title, line, testid) {
-  const open = isOpen(kind);
-  return html`<button type="button" class="secret" data-hold="${kind}" data-open="${open}" data-tone="${open ? line.tone : ''}" aria-pressed="${open}" data-testid="${testid}">
-    ${ico(open ? 'i-eye' : 'i-eye-off')}
-    <span class="secret-text">${open ? html`<strong>${line.text}</strong>` : html`<strong>${title}</strong><span class="small muted">Press and hold. Double-tap to keep it open.</span>`}</span>
-  </button>`;
+// Same request timing, sound, buzz and toast for every role. The Witch's and Cupid's visible
+// pick is camouflage and sends nothing; the pack's meeting sends {} whoever was picked.
+async function confirmNight() {
+  const t = state.snap?.game?.night?.task;
+  const target = ui.pick[0];
+  if (!t || !target || ui.busy.night) return;
+  ui.busy.night = true;
+  render();
+  buzz();
+  chime('tap');
+  const started = performance.now();
+  let res = { ok: true };
+  if (LIVE_KINDS.includes(t.kind)) res = await emit('game:night-action', { target });
+  else if (t.kind === 'meet') res = await emit('game:night-action', {});
+  const wait = 400 - (performance.now() - started);
+  if (wait > 0) await sleep(wait);
+  ui.busy.night = false;
+  if (res.ok) { setLocalNightDone(); toast('Sent.', 'i-check'); }
+  else if (res.code === 'RATE_LIMITED' || res.code === 'OFFLINE' || res.code === 'TIMEOUT') showError(res);
+  else toast('That pick did not go through. Pick someone else and confirm again.', 'i-alert');
+  render();
 }
 
 const bigTimer = (g) => {
@@ -1243,15 +1272,19 @@ const bigTimer = (g) => {
     <span class="timer-val big-timer">${g.paused ? 'Paused' : clockText(ms)}</span><span class="timer-label">${d.label || ''}</span></div>`;
 };
 
-function viewNightDone(g, t) {
+function viewNightDone(g) {
+  const open = peeking();
   return html`<main class="main" id="main" data-testid="night-done">
     <div class="task-done">
       <span class="task-done-mark">${ico('i-moon')}</span>
-      <h2 class="task-done-title" tabindex="-1">Done. Waiting for the village</h2>
+      <h2 class="task-done-title">Done. Waiting for the village</h2>
       ${bigTimer(g)}
       <p class="task-note">Keep your face still and your phone close.</p>
     </div>
-    ${secretRow('secret', 'Hold to see your result', resultLine(g, t), 'result-hold')}
+    <button type="button" class="secret" data-act="peek" data-open="${open}" aria-expanded="${open}" aria-controls="private-panel" data-testid="private-open">
+      ${ico(open ? 'i-eye' : 'i-eye-off')}
+      <span class="secret-text"><strong>${open ? 'Hide your private panel' : 'Open your private panel'}</strong><span class="small muted">Your result and anything left to do. It hides itself after a few seconds.</span></span>
+    </button>
   </main>`;
 }
 
@@ -1264,13 +1297,161 @@ function viewGhostNight(g, t) {
   return html`<main class="main" id="main" data-testid="ghost">
     <div class="ghost-note">${ico('i-ghost')}<div><p class="ghost-note-title">You’re a ghost: no talking, no faces.</p><p class="small muted">Stay quiet and keep a straight face until the game ends.</p></div></div>
     <div class="task-head">
-      <h2 class="task-prompt" tabindex="-1" data-testid="task-prompt">${t?.prompt || 'Who will the wolves take tonight?'}</h2>
-      <p class="task-note">${TASK_NOTE.ghost}</p>
+      <h2 class="task-prompt" data-testid="task-prompt">${t?.prompt || 'Who will the wolves take tonight?'}</h2>
+      <p class="task-note">Just for fun. Your guesses are scored at the end.</p>
     </div>
     <div class="tiles" role="group" aria-label="Players" data-testid="player-grid">${tiles}</div>
   </main>
   ${actionbar(html`<button type="button" class="btn btn-primary btn-block btn-big" data-act="confirm" data-testid="confirm-btn" ${pick && !same && t ? '' : raw('disabled')}>${same ? 'Guess saved' : guess ? 'Change guess' : 'Save guess'}</button>`,
     guess ? `Your guess: ${nameOf(guess)}` : '')}`;
+}
+
+/* ---------- The private panel (Peek at night) ---------- */
+
+const PEEK_MS = 8000;
+let peekTimer = null;
+// Peek toggles on a tap and hides itself after a few seconds without a touch inside it.
+function setPeek(open) {
+  ui.peekOpen = !!open;
+  clearTimeout(peekTimer);
+  if (open) peekTimer = setTimeout(() => setPeek(false), PEEK_MS);
+  else ui.privNote = '';
+  render();
+  if (open) requestAnimationFrame(() => document.getElementById('private-title')?.focus({ preventScroll: true }));
+}
+function keepPeekOpen() {
+  if (!ui.peekOpen) return;
+  clearTimeout(peekTimer);
+  peekTimer = setTimeout(() => setPeek(false), PEEK_MS);
+}
+
+function pickChips(ids, act, selected, testid) {
+  const you = state.snap.room.you;
+  return html`<div class="pick-chips" role="group">${ids.map((id) => html`<button type="button" class="pick-chip" data-act="${act}" data-arg="${id}" data-testid="${testid}-${id}" aria-pressed="${selected.includes(id)}">
+    ${avatar(nameOf(id), { size: 'avatar-xs' })}<span class="pick-chip-name" translate="no">${id === you ? 'You' : nameOf(id)}</span>${selected.includes(id) ? ico('i-check', 'ico-sm') : ''}</button>`)}</div>`;
+}
+const privLead = (text) => html`<p class="private-lead">${text}</p>`;
+const privNote = (text) => html`<p class="small muted">${text}</p>`;
+
+function privateWolf(t) {
+  const w = t.wolf || { slot: 1, slots: 1, picks: {}, locked: [] };
+  const you = state.snap.room.you;
+  const locked = w.locked || [];
+  if (t.done) return privLead(locked.length ? `The pack chose ${listJoin(locked.map(nameOf))}.` : 'The pack made no kill tonight.');
+  const picks = Object.entries(w.picks || {});
+  const mine = w.picks?.[you] ?? (locked.includes(t.submitted?.target) ? null : t.submitted?.target) ?? null;
+  const differ = new Set(picks.map(([, v]) => v)).size > 1;
+  return html`${privLead(t.prompt)}
+    ${(w.slots || 1) > 1 ? html`<span class="tag wolf-slot" data-testid="wolf-slot">Victim ${Math.min(w.slots, locked.length + 1)} of ${w.slots}</span>` : ''}
+    ${locked.length ? privNote(`Already chosen: ${listJoin(locked.map(nameOf))}.`) : ''}
+    <div class="private-block" data-testid="pack-picks"><p class="card-block-title">The pack’s picks</p>
+      ${picks.length ? html`<ul class="pack-picks">${picks.map(([wolf, target]) => html`<li><span translate="no">${wolf === you ? 'You' : nameOf(wolf)}</span>${ico('i-target', 'ico-sm')}<strong translate="no">${nameOf(target)}</strong></li>`)}</ul>` : privNote('No picks yet.')}
+      ${privNote(differ ? 'Picks differ. Agree on one victim; 20 seconds before the end the most-picked player is taken.' : 'When every wolf picks the same player, the kill locks.')}
+    </div>
+    <div class="private-block"><p class="card-block-title">${mine ? 'Change your pick' : 'Your pick'}</p>${pickChips(t.targets || [], 'priv-wolf', mine ? [mine] : [], 'priv-wolf')}</div>`;
+}
+
+function privateWitch(t) {
+  const w = t.witch || { waiting: true, victims: [], canHeal: false, canPoison: false };
+  const sub = t.submitted || {};
+  const used = html`${w.canHeal ? '' : privNote('Your healing potion is used up.')}${w.canPoison ? '' : privNote('Your poison is used up.')}`;
+  if (t.done) {
+    const parts = [sub.heal ? `you healed ${nameOf(sub.heal)}` : '', sub.poison ? `you poisoned ${nameOf(sub.poison)}` : ''].filter(Boolean);
+    return privLead(parts.length ? `Tonight ${listJoin(parts)}.` : 'You used no potion tonight.');
+  }
+  if (w.waiting) return html`${privLead('The pack is still choosing.')}${privNote('Check back here. Once they lock in you get at least 20 seconds to heal, poison, both or neither. Doing nothing means no potions tonight.')}${used}`;
+  const victims = w.victims || [];
+  return html`${privLead(t.prompt)}
+    ${w.canHeal ? html`<div class="private-block"><p class="card-block-title">Heal</p>
+      ${victims.length ? html`${privNote(`The wolves attacked ${listJoin(victims.map(nameOf))}.`)}${pickChips(victims, 'priv-heal', ui.witch.heal ? [ui.witch.heal] : [], 'priv-heal')}` : privNote('Nobody was attacked tonight.')}</div>` : ''}
+    ${w.canPoison ? html`<div class="private-block"><p class="card-block-title">Poison</p>${pickChips(t.targets || [], 'priv-poison', ui.witch.poison ? [ui.witch.poison] : [], 'priv-poison')}</div>` : ''}
+    ${used}
+    <div class="private-actions">
+      <button type="button" class="btn btn-primary btn-block" data-act="priv-witch" data-arg="use" data-testid="priv-witch-use" ${ui.witch.heal || ui.witch.poison ? '' : raw('disabled')}>Use potions</button>
+      <button type="button" class="btn btn-block btn-sm" data-act="priv-witch" data-arg="pass" data-testid="priv-witch-pass">Pass tonight</button>
+    </div>`;
+}
+
+function privateCupid(t) {
+  if (t.done) return privLead(Array.isArray(t.submitted?.targets) ? `You linked ${listJoin(t.submitted.targets.map(nameOf))}.` : 'Your arrow is spent.');
+  return html`${privLead(t.prompt)}${privNote('Pick two players. You may pick yourself. They learn at dawn that they are in love.')}
+    ${pickChips(t.targets || [], 'priv-cupid', ui.cupid, 'priv-cupid')}
+    <button type="button" class="btn btn-primary btn-block" data-act="priv-cupid-send" data-testid="priv-cupid-send" ${ui.cupid.length === 2 ? '' : raw('disabled')}>${ui.cupid.length === 2 ? `Link ${listJoin(ui.cupid.map(nameOf))}` : 'Pick two players'}</button>`;
+}
+
+function privateDoctor(g, t) {
+  const you = state.snap.room.you;
+  const who = (id) => (id === you ? 'yourself' : nameOf(id));
+  if (t.done) return privLead(t.submitted?.target ? `You are protecting ${who(t.submitted.target)} tonight.` : 'You protected nobody tonight.');
+  const notAgain = g.players.filter((p) => p.alive && !(t.targets || []).includes(p.id)).map((p) => p.id);
+  const selfOk = (t.targets || []).includes(you);
+  return html`${privLead(t.prompt)}
+    ${notAgain.length ? html`<p class="small" data-testid="doctor-not-again">Not ${listJoin(notAgain.map(who))} again: you protected them last night.</p>` : ''}
+    ${privNote('The player you confirm on the main screen is the one you protect.')}
+    ${selfOk ? html`<button type="button" class="btn btn-block btn-sm" data-act="priv-doctor-self" data-testid="priv-doctor-self">Protect yourself instead</button>` : ''}`;
+}
+
+function privateBody(g, t) {
+  if (!t) return privLead('Nothing to do tonight.');
+  switch (t.kind) {
+    case 'seer':
+    case 'sorceress':
+      if (t.result?.text) return html`<p class="private-result" data-tone="${t.result.wolf || t.result.seer ? 'wolf' : 'good'}" data-testid="private-result">${t.result.text}</p>`;
+      return html`${privLead(t.prompt)}${privNote('The player you confirm on the main screen is the one you check. The answer appears here.')}`;
+    case 'doctor': return privateDoctor(g, t);
+    case 'decoy':
+      return visiblyDone(t) ? html`${privLead(t.submitted?.target ? `You suspect ${nameOf(t.submitted.target)}.` : 'Nothing else to do tonight.')}${privNote('Your pick shows up in the end-of-game recap.')}`
+        : html`${privLead(t.prompt)}${privNote('You have no night power. Pick anyone you suspect; it shows up in the end-of-game recap.')}`;
+    case 'meet': return html`${privLead(t.prompt)}${privNote('No kill tonight. Confirm any player on the main screen once you have seen your pack.')}`;
+    case 'wolf': return privateWolf(t);
+    case 'witch': return privateWitch(t);
+    case 'cupid': return privateCupid(t);
+    default: return privLead(t.prompt || 'Nothing to do tonight.');
+  }
+}
+
+function viewPrivatePanel() {
+  const g = state.snap?.game;
+  if (!g || g.phase !== 'night' || !g.me?.alive || !ui.peekOpen) return '';
+  const info = roleInfo(g.me.role);
+  const lines = knowsLines(g);
+  const notes = g.me.notes || [];
+  return html`<section class="private-panel" id="private-panel" data-key="private" aria-labelledby="private-title" data-testid="private-panel">
+    <div class="private-head">
+      <span class="role-ico" data-team="${info.team}">${roleSigil(g.me.role)}</span>
+      <div class="grow"><h2 class="private-title" id="private-title" tabindex="-1">${info.name}</h2><p class="small muted">Private. Hides itself after a few seconds.</p></div>
+      <button type="button" class="icon-btn icon-btn-plain" data-act="peek" data-testid="private-close" aria-label="Hide the private panel">${ico('i-x')}</button>
+    </div>
+    <div class="private-body">
+      ${privateBody(g, g.night?.task || null)}
+      ${ui.privNote ? html`<p class="private-status" data-testid="private-status">${ui.privNote}</p>` : ''}
+      ${lines.length || notes.length ? html`<div class="private-block">
+        ${lines.length ? html`<p class="card-block-title">What you know</p>${lines.map((l) => html`<p class="small">${l}</p>`)}` : ''}
+        ${notes.length ? html`<p class="card-block-title">Your notes</p>${notes.map((n) => html`<p class="small">Night ${n.round}: ${n.text}</p>`)}` : ''}
+      </div>` : ''}
+    </div>
+  </section>`;
+}
+
+// Private actions answer inside the panel only: no toast, no buzz, no live region.
+async function privateAction(payload) {
+  keepPeekOpen();
+  ui.privNote = 'Sending…';
+  render();
+  const res = await emit('game:night-action', payload);
+  ui.privNote = res.ok ? 'Saved.' : res.code === 'RATE_LIMITED' ? 'Too many taps. Wait a second and try again.' : res.error || 'That did not go through. Try again.';
+  keepPeekOpen();
+  render();
+  return res;
+}
+
+// The same held-down row for every role (used for the private news at dawn).
+function secretRow(kind, title, line, testid) {
+  const open = isOpen(kind);
+  return html`<button type="button" class="secret" data-hold="${kind}" data-open="${open}" data-tone="${open ? line.tone : ''}" aria-pressed="${open}" data-testid="${testid}">
+    ${ico(open ? 'i-eye' : 'i-eye-off')}
+    <span class="secret-text">${open ? html`<strong>${line.text}</strong>` : html`<strong>${title}</strong><span class="small muted">Press and hold. Double-tap to keep it open.</span>`}</span>
+  </button>`;
 }
 
 /* ---------- Day ---------- */
@@ -1728,7 +1909,7 @@ async function homeSubmit(kind) {
   store.set(NAME_KEY, name);
   ui.home.busy = kind;
   render();
-  const res = kind === 'create' ? await emit('room:create', { name }) : await emit('room:join', { code, name });
+  const res = kind === 'create' ? await emitRetry('room:create', { name }) : await emitRetry('room:join', { code, name });
   ui.home.busy = false;
   if (res.ok) {
     saveSeat({ code: res.code || code, playerId: res.playerId, token: res.token, name });
@@ -1748,17 +1929,23 @@ async function homeSubmit(kind) {
 
 async function rejoin() {
   const seat = savedSeat();
-  if (!seat) return;
-  const res = await send('room:resume', { code: seat.code, playerId: seat.playerId, token: seat.token }, { quiet: true });
+  if (!seat || ui.busy['room:resume']) return;
+  ui.busy['room:resume'] = true;
+  render();
+  const res = await emitRetry('room:resume', { code: seat.code, playerId: seat.playerId, token: seat.token });
+  ui.busy['room:resume'] = false;
   if (res.ok) {
+    saveSeat({ ...seat, left: false });   // the server cleared `left` and sends state
     state.away = false;
     ui.notice = null;
-  } else if (['BAD_SEAT', 'NO_ROOM', 'NOT_IN_ROOM', 'BAD_CODE'].includes(res.code)) {
+  } else if (res.code === 'BAD_SEAT') {
     forgetSeat();
     state.snap = null;
-    state.away = false;
-    ui.resuming = false;
-    ui.notice = { title: 'That seat is gone', text: res.error || 'The room has closed. Create a room or join another one.' };
+    ui.notice = { title: 'Your seat is gone', text: `Your seat in ${seat.code} moved to another phone, or the host started a new game after you left. Join again with the code if the room is still open.` };
+  } else if (res.code === 'NO_ROOM' || res.code === 'BAD_CODE') {
+    forgetSeat();
+    state.snap = null;
+    ui.notice = { title: `Room ${seat.code} has closed`, text: 'Nobody is playing in it any more. Create a room or join another one.' };
   } else {
     showError(res);
   }
@@ -1768,7 +1955,7 @@ async function rejoin() {
 async function reclaimSeat() {
   const r = ui.reclaim;
   if (!r) return;
-  const res = await send('room:reclaim', { code: r.code, name: r.name }, { quiet: true });
+  const res = await emitRetry('room:reclaim', { code: r.code, name: r.name });
   if (res.ok) ui.reclaim = { ...r, stage: 'waiting', requestId: res.requestId };
   else { ui.reclaim = null; showError(res); }
   render();
@@ -1799,7 +1986,6 @@ function stepRole(id, dir) {
 }
 
 function setSetting(key, value) {
-  if (key === 'witchMode') { ui.witchMode = value; render(); return; }
   if (!state.snap?.room?.isHost) return;
   if (key === 'preset') { if (PRESETS[value]) settingsPatch(PRESETS[value].patch); return; }
   const parsed = value === 'true' ? true : value === 'false' ? false : value;
@@ -1814,32 +2000,20 @@ function toggleAllowed(id) {
   settingsPatch({ allowedRoles: ROLE_ORDER.filter((x) => set.has(x)) });
 }
 
+// One visible pick for everyone (night grid, ghost guess, Hunter's shot).
 function pickTile(id, el) {
-  const g = state.snap?.game;
-  if (!g || el?.getAttribute('aria-disabled') === 'true') return;
-  const t = g.night?.task;
-  if (g.phase === 'night' && t?.kind === 'witch') {
-    const k = ui.witchMode;
-    ui.witch = { ...ui.witch, [k]: ui.witch[k] === id ? null : id };
-  } else if (g.phase === 'night' && t?.choose === 2) {
-    ui.pick = ui.pick.includes(id) ? ui.pick.filter((x) => x !== id) : [...ui.pick, id].slice(-2);
-  } else {
-    ui.pick = ui.pick[0] === id ? [] : [id];
-  }
+  if (!state.snap?.game || el?.getAttribute('aria-disabled') === 'true') return;
+  ui.pick = ui.pick[0] === id ? [] : [id];
   render();
 }
 
-async function confirmTask() {
+// A ghost's guess for tonight (dead players only; it never affects the game).
+async function confirmGhostGuess() {
   const t = state.snap?.game?.night?.task;
-  if (!t) return;
-  let payload;
-  if (t.kind === 'cupid') { if (ui.pick.length < 2) return; payload = { targets: ui.pick.slice(0, 2) }; }
-  else if (t.kind === 'meet') payload = {};
-  else if (t.kind === 'witch') payload = { heal: ui.witch.heal, poison: ui.witch.poison };
-  else { if (!ui.pick[0]) return; payload = { target: ui.pick[0] }; }
+  if (!t || !ui.pick[0]) return;
   buzz();
   chime('tap');
-  const res = await send('game:night-action', payload);
+  const res = await send('game:night-action', { target: ui.pick[0] });
   if (res.ok) toast('Sent.', 'i-check');
 }
 
@@ -1855,11 +2029,16 @@ async function castVote(target) {
 
 async function leaveRoom() {
   const inGame = !!state.snap?.game;
+  const seat = savedSeat();
   const res = await send('room:leave', {});
   if (!res.ok) return;
   ui.sheet = null;
-  if (inGame) state.away = true;
-  else { forgetSeat(); state.snap = null; }
+  state.snap = null;
+  state.away = false;
+  if (inGame && seat) saveSeat({ ...seat, left: true });   // the token stays valid until the game ends
+  else forgetSeat();
+  // Reconnect without the seat, so this phone stops receiving the game until it rejoins.
+  if (socket) socket.disconnect().connect();
   render();
 }
 
@@ -1927,7 +2106,23 @@ const ACTIONS = {
   approve: (el) => { const [requestId, yes] = el.dataset.arg.split(':'); send('host:approve-reclaim', { requestId, allow: yes === 'yes' }); },
   seen: () => { buzz(); send('game:seen-role', {}); },
   pick: (el) => pickTile(el.dataset.arg, el),
-  confirm: () => confirmTask(),
+  confirm: () => (state.snap?.game?.me?.alive ? confirmNight() : confirmGhostGuess()),
+  peek: () => setPeek(!ui.peekOpen),
+  'priv-wolf': (el) => privateAction({ target: el.dataset.arg }),
+  'priv-heal': (el) => { ui.witch = { ...ui.witch, heal: ui.witch.heal === el.dataset.arg ? null : el.dataset.arg }; keepPeekOpen(); render(); },
+  'priv-poison': (el) => { ui.witch = { ...ui.witch, poison: ui.witch.poison === el.dataset.arg ? null : el.dataset.arg }; keepPeekOpen(); render(); },
+  'priv-witch': (el) => privateAction(el.dataset.arg === 'pass' ? { heal: null, poison: null } : { heal: ui.witch.heal, poison: ui.witch.poison }),
+  'priv-cupid': (el) => {
+    const id = el.dataset.arg;
+    ui.cupid = ui.cupid.includes(id) ? ui.cupid.filter((x) => x !== id) : [...ui.cupid, id].slice(-2);
+    keepPeekOpen();
+    render();
+  },
+  'priv-cupid-send': () => { if (ui.cupid.length === 2) privateAction({ targets: ui.cupid.slice(0, 2) }); },
+  'priv-doctor-self': async () => {
+    const res = await privateAction({ target: state.snap.room.you });
+    if (res.ok) { setLocalNightDone(); render(); }
+  },
   vote: (el) => { if (el.getAttribute('aria-disabled') !== 'true') castVote(el.dataset.arg); },
   shoot: () => { const target = ui.pick[0]; if (target) { buzz(); send('game:shoot', { target }); } },
   host: (el) => {
@@ -1939,7 +2134,7 @@ const ACTIONS = {
     () => { ui.sheet = null; send('host:end-game', {}); }),
   'play-again': () => send('host:play-again', {}),
   leave: () => confirmThen(state.snap?.game
-    ? { title: 'Leave this game?', text: 'You stay in the game as a player who left, and the host role passes on. You can rejoin from the home screen.', yes: 'Leave', tone: 'danger' }
+    ? { title: 'Leave this game?', text: 'Your seat stays in the game, marked as left. You can rejoin from the home screen until the game ends. If you are the host, host passes to someone else.', yes: 'Leave', tone: 'danger' }
     : { title: 'Leave the room?', text: 'You can join again with the code.', yes: 'Leave', tone: 'danger' }, leaveRoom),
   pref: (el) => togglePref(el.dataset.arg),
   'dialog-yes': () => { const d = ui.dialog; ui.dialog = null; render(); d?.run?.(); },
@@ -1971,6 +2166,7 @@ function holdEnd(e, cancelled = false) {
   ui.hold[kind] = false;
   const now = performance.now();
   lastPointerUp = now;
+  if (!cancelled && now - start < 300 && kind === 'eye') { setPeek(!ui.peekOpen); return; }
   if (!cancelled && now - start < 300) {
     // A quick tap closes a reveal kept open; two quick taps keep it open.
     if (ui.sticky[kind]) { ui.sticky[kind] = false; lastTap[kind] = 0; }
@@ -1983,6 +2179,8 @@ function holdEnd(e, cancelled = false) {
 function releaseHolds() {
   activeHold = null;
   ui.hold = {};
+  ui.peekOpen = false;
+  clearTimeout(peekTimer);
   render();
 }
 
@@ -1993,6 +2191,7 @@ function onClick(e) {
     const t = performance.now();
     if (t - lastPointerDown > 700 && t - lastPointerUp > 300) {
       const k = holdEl.dataset.hold;
+      if (k === 'eye') { setPeek(!ui.peekOpen); return; }
       ui.sticky[k] = !ui.sticky[k];
       render();
     }
@@ -2049,7 +2248,11 @@ function bindEvents() {
   document.addEventListener('change', onChange);
   document.addEventListener('keydown', onKeyDown);
   document.addEventListener('submit', (e) => e.preventDefault());
-  document.addEventListener('pointerdown', (e) => { requestWakeLock(); holdStart(e); });
+  document.addEventListener('pointerdown', (e) => {
+    requestWakeLock();
+    if (e.target.closest?.('.private-panel')) keepPeekOpen();
+    holdStart(e);
+  });
   document.addEventListener('pointerup', (e) => holdEnd(e));
   document.addEventListener('pointercancel', (e) => holdEnd(e, true));
   document.addEventListener('contextmenu', (e) => { if (e.target.closest('[data-hold]')) e.preventDefault(); });
@@ -2099,8 +2302,10 @@ async function startMock() {
   state.away = !!m.away;
   mockSeat = m.seat || null;
   ui.forceBanner = !!m.banner;
+  state.restarting = !!m.restarting;
   syncPick();
   ui.screenKey = screenKeyOf();
+  if (m.nightDone) mockNightDone = nightKey();
   applyUi(m.ui);
   render();
 }
@@ -2132,6 +2337,7 @@ function mockEmit(event, payload) {
       const t = g?.night?.task;
       if (t) {
         t.submitted = payload;
+        if (t.kind === 'wolf' && t.wolf && payload.target) t.wolf.picks = { ...t.wolf.picks, [you]: payload.target };
         if (t.kind !== 'wolf') t.done = true;
         if ((t.kind === 'seer' || t.kind === 'sorceress') && payload.target) {
           t.result = t.kind === 'seer'
@@ -2184,7 +2390,7 @@ async function boot() {
   booted = true;
   setInterval(tick, 250);
   if (MOCK) { await startMock(); return; }
-  if (savedSeat()) {
+  if (handshakeSeat()) {
     ui.resuming = true;
     setTimeout(() => { if (ui.resuming) { ui.resuming = false; render(); } }, 5000);
   }

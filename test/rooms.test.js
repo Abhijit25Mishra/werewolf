@@ -604,14 +604,40 @@ test('ready-up starts a game in the reveal phase; late joiners wait; leaving mar
   assert.equal((await ben.emit('host:advance', { action: 'resume' })).code, 'NOT_HOST');
   assert.equal((await host.emit('host:advance', { action: 'fly' })).ok, false);
 
-  // Leaving mid-game keeps the seat in the game, marked left, and retires its token.
+  // Leaving mid-game keeps the seat, marked left, with its token still valid.
   const benSeat = { ...ben.seat };
+  const benRole = ben.state.game.me.role;
   assert.equal((await ben.emit('room:leave')).ok, true);
   const hs = await host.waitState((x) => playerIn(x, benSeat.playerId).left, 'Ben marked left');
   assert.equal(playerIn(hs, benSeat.playerId).connected, false);
   assert.equal(playerIn(hs, benSeat.playerId).inGame, true);
-  await phone(benSeat).waitEvent('seat:invalid');
-  assert.equal((await phone().emit('room:join', { code, name: 'Ben' })).code, 'NAME_TAKEN');
+  const other = phone();
+  assert.equal((await other.emit('room:join', { code, name: 'ben' })).code, 'NAME_TAKEN_OFFLINE', 'a left seat counts as offline');
+
+  // Rejoin: resume brings Ben back into the same game with the same role.
+  const back = phone();
+  assert.equal((await back.emit('room:resume', benSeat)).ok, true);
+  const bs = await back.waitState((x) => x.room.you === benSeat.playerId && x.game && !playerIn(x, benSeat.playerId).left, 'Ben back');
+  assert.equal(bs.game.me.role, benRole);
+  await host.waitState((x) => playerIn(x, benSeat.playerId).connected && !playerIn(x, benSeat.playerId).left, 'host sees Ben back');
+
+  // Leave again; another device takes the left seat back with the host's approval.
+  assert.equal((await back.emit('room:leave')).ok, true);
+  await host.waitState((x) => playerIn(x, benSeat.playerId).left, 'Ben left again');
+  const asked = await other.emit('room:reclaim', { code, name: 'Ben' });
+  assert.equal(asked.ok, true, asked.error);
+  await host.waitState((x) => x.room.reclaims.length === 1, 'takeover request');
+  assert.equal((await host.emit('host:approve-reclaim', { requestId: asked.requestId, allow: true })).ok, true);
+  const taken = await other.waitEvent('reclaim:result');
+  assert.equal(taken.ok, true);
+  assert.equal(taken.playerId, benSeat.playerId);
+  const os = await other.waitState((x) => x.room.you === benSeat.playerId && x.game && !playerIn(x, benSeat.playerId).left, 'seat taken back');
+  assert.equal(os.game.me.role, benRole);
+  assert.equal((await phone().emit('room:resume', benSeat)).code, 'BAD_SEAT', 'the old token is retired');
+
+  // Ben leaves once more and is still left when the host ends the game, so the seat is dropped.
+  assert.equal((await other.emit('room:leave')).ok, true);
+  await host.waitState((x) => playerIn(x, benSeat.playerId).left, 'Ben left for good');
 
   // The host aborts to the lobby: Ben is dropped, Dev joins the next game.
   assert.equal((await host.emit('host:end-game')).ok, true);

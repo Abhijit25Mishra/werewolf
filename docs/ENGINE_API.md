@@ -36,6 +36,7 @@ All take `now` (ms), mutate `state` in place, and may advance the phase.
 | `G.shoot(state, playerId, target, now)` | The dead Hunter's shot |
 | `G.hostAction(state, action, now, ctx)` | `action` is a PROTOCOL `HostAction`; `ctx.isOnline(playerId)` decides whether `skip-shot` is allowed |
 | `G.onDeadline(state, now)` | Handles every deadline at or before `now` (night minimum, pack auto-lock, night end, reveal, discussion, vote, shot, verdict) |
+| `G.shiftDeadlines(state, deltaMs)` | Moves every pending deadline, and the start of a pause, `deltaMs` later. The server calls it when it restores a saved game after a restart, with `deltaMs = now - savedAt`, so every timer keeps the time it had left. A non-positive or non-finite `deltaMs` changes nothing. Takes no `now` and never advances the phase |
 
 ## Queries
 

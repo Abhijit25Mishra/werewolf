@@ -12,7 +12,7 @@ Open any screen without a server at `/?mock=<name>`; `/?mock=list` links to all 
 | `screen-<name>` | The current screen: `home`, `resuming`, `reclaim`, `lobby`, `reveal`, `night`, `day-discussion`, `day-shot`, `day-vote`, `day-verdict`, `over`, `late`, `mocks` |
 | `announcer` | Polite live region for screen-reader announcements |
 | `toasts`, `toast` | Toast container and each toast (errors arrive here) |
-| `reconnect-banner` | "Reconnecting to the game" banner |
+| `reconnect-banner` | "Reconnecting to the game", or "Updating the server… reconnecting" after `server:restarting` |
 | `actionbar`, `actionbar-note` | Sticky bottom bar and its status line |
 
 ## Home
@@ -25,8 +25,9 @@ Open any screen without a server at `/?mock=<name>`; `/?mock=list` links to all 
 | `join-code` | 4-letter room code (filled from `/?room=CODE`) |
 | `join-btn` | Join |
 | `code-error` | Error under the code field (`NO_ROOM`, `BAD_CODE`, `ROOM_FULL`) |
-| `rejoin`, `rejoin-btn` | "Rejoin FANG as Ana" card and its button (`room:resume`) |
-| `notice` | Message after being kicked, `seat:invalid`, `server:shutdown` or a refused takeover |
+| `rejoin`, `rejoin-btn` | "Rejoin FANG as Ana" card and its button (`room:resume`); after a mid-game Leave it says "You left the game. You can rejoin until it ends." |
+| `notice` | Message after being kicked, `seat:invalid`, `server:shutdown`, a refused takeover or a failed rejoin |
+| `home-foot` | Footer note, including "The server is updating. Trying again…" while a RETRY is pending |
 | `modal-reclaim-offer` | Shown on `NAME_TAKEN_OFFLINE` |
 | `reclaim-btn` | Ask the host for the seat (`room:reclaim`) |
 | `reclaim-other` | Use another name instead |
@@ -74,7 +75,7 @@ Open any screen without a server at `/?mock=<name>`; `/?mock=list` links to all 
 | `timer` | Countdown (`role="timer"`) |
 | `my-role-btn`, `my-role-card` | Hold to see your role, and the card it shows |
 | `roles-btn` | Opens `sheet-roles` |
-| `eye-btn` | Peek: hold to see private marks, pack picks and blocked lovers |
+| `eye-btn` | Peek: a tap shows private marks and, at night, the private panel; it hides itself after 8 s. Holding shows them only while held |
 | `menu-btn` | Opens `sheet-menu` |
 
 ## Role reveal
@@ -88,18 +89,22 @@ Open any screen without a server at `/?mock=<name>`; `/?mock=list` links to all 
 
 ## Night
 
+Without Peek every living player sees the same screens: the pick grid, Confirm, then "Done. Waiting for the village". Role-specific text and the real choices live in the private panel.
+
 | Id | What it is |
 | --- | --- |
-| `task` | The task region (`data-kind` is the task kind) |
-| `task-prompt` | Instruction line |
-| `player-grid` | Tile grid (also on day screens) |
-| `tile-<playerId>` | A player tile (`aria-pressed` when selected) |
-| `wolf-slot` | "Victim 2 of 2" |
-| `witch-mode-heal`, `witch-mode-poison` | Witch: which potion a tap assigns |
-| `confirm-btn` | Confirm the task (also the ghost's guess) |
-| `night-done` | "Done. Waiting for the village" |
-| `big-timer` | Large countdown on waiting screens |
-| `result-hold` | Hold to see your result (identical for every role) |
+| `task`, `task-prompt` | The shared pick screen ("Pick a player, then confirm") |
+| `player-grid`, `tile-<playerId>` | Tile grid and a tile (`aria-pressed` when picked, `aria-disabled` when not a legal target; it looks the same either way) |
+| `confirm-btn` | Confirm (also the ghost's guess) |
+| `night-done`, `big-timer` | The shared Done screen and its countdown |
+| `private-open` | Opens the private panel from the Done screen (same as tapping `eye-btn`) |
+| `private-panel`, `private-close` | The private panel (auto-hides after 8 s without a touch) and its close button |
+| `private-result` | Seer or Sorceress answer |
+| `private-status` | "Saved." or an error after a private action (not a live region) |
+| `pack-picks`, `wolf-slot`, `priv-wolf-<playerId>` | Wolves: the pack's picks, "Victim 2 of 2", change your pick |
+| `priv-heal-<playerId>`, `priv-poison-<playerId>`, `priv-witch-use`, `priv-witch-pass` | Witch: heal a victim, poison someone, send or pass (only once the pack has locked) |
+| `priv-cupid-<playerId>`, `priv-cupid-send` | Cupid: choose the two Lovers and link them |
+| `doctor-not-again`, `priv-doctor-self` | Doctor: who can't be protected again, protect yourself |
 | `ghost` | Ghost screen at night |
 
 ## Day

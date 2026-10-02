@@ -43,10 +43,17 @@ const newToken = () => crypto.randomBytes(16).toString('hex');      // 32 hex ch
 const nameKey = (name) => name.toLowerCase();
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
-function sameToken(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
-  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+// Rooms keep only a SHA-256 of each seat token; the raw token goes to the player's device alone.
+const hashToken = (token) => crypto.createHash('sha256').update(String(token)).digest('hex');
+
+// Whether a raw token from a client matches a stored hash, in constant time.
+function tokenMatches(hash, token) {
+  if (typeof hash !== 'string' || typeof token !== 'string' || !token || token.length > 128) return false;
+  const given = hashToken(token);
+  return hash.length === given.length && crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(given));
 }
+
+const SNAPSHOT_VERSION = 1;
 
 function normalizeCode(raw) {
   const code = typeof raw === 'string' ? raw.trim().toUpperCase() : '';
@@ -213,12 +220,14 @@ function createRooms(options = {}) {
     return fail('SERVER_FULL', 'No free room codes; try again');
   }
 
+  // A new seat. Returns the raw token for the player's device; the room keeps only its hash.
   function newPlayer(room, name, now) {
     let id = randomId();
     while (findPlayer(room, id)) id = randomId();
-    const player = { id, name, token: newToken(), ready: false, sockets: 0, left: false, joinedAt: now };
+    const token = newToken();
+    const player = { id, name, tokenHash: hashToken(token), ready: false, sockets: 0, left: false, joinedAt: now };
     room.players.push(player);
-    return player;
+    return { player, token };
   }
 
   // Deals the line-up for the next game. Auto mode builds a balanced deck for the seated players;
@@ -269,11 +278,14 @@ function createRooms(options = {}) {
     room.lastActiveAt = now;
   }
 
-  function create(rawName, now) {
+  // `code` may be picked by server.js after checking the store; otherwise a free one is drawn here.
+  // Returns the raw seat token for the creator's device.
+  function create(rawName, now, { code } = {}) {
     const name = cleanName(rawName);
     if (rooms.size >= maxRooms) fail('SERVER_FULL', 'The server is full right now; try again later');
+    if (code && rooms.has(code)) fail('SERVER_FULL', 'That room code was just taken; try again');
     const room = {
-      code: newCode(),
+      code: code || newCode(),
       hostId: null,
       players: [],
       settings: defaultSettings(),
@@ -287,13 +299,13 @@ function createRooms(options = {}) {
       emptySince: now,       // nobody connected yet; server.js binds the creator right away
       hostOfflineAt: null,
     };
-    const player = newPlayer(room, name, now);
+    const { player, token } = newPlayer(room, name, now);
     room.hostId = player.id;
     room.hostOfflineAt = now;
     deal(room);
     refresh(room, now);
     rooms.set(room.code, room);
-    return { room, player };
+    return { room, player, token };
   }
 
   // Joins the lobby, or during a game waits in the list and plays the next game.
@@ -302,11 +314,12 @@ function createRooms(options = {}) {
     const name = cleanName(rawName);
     const same = room.players.find((p) => nameKey(p.name) === nameKey(name));
     if (same) {
-      if (!same.left && same.sockets === 0) fail('NAME_TAKEN_OFFLINE', `${same.name} is offline. Is that you? Ask the host to let you take the seat back`);
+      // A seat that left the game counts as offline: its owner can take it back from here.
+      if (same.left || same.sockets === 0) fail('NAME_TAKEN_OFFLINE', `${same.name} is offline. Is that you? Ask the host to let you take the seat back`);
       fail('NAME_TAKEN', 'That name is taken in this room');
     }
     if (seatedPlayers(room).length >= R.MAX_PLAYERS) fail('ROOM_FULL', 'This room is full');
-    const player = newPlayer(room, name, now);
+    const { player, token } = newPlayer(room, name, now);
     try {
       ensureDeck(room);
     } catch (e) {
@@ -314,22 +327,28 @@ function createRooms(options = {}) {
       throw e;
     }
     refresh(room, now);
-    return { room, player };
+    return { room, player, token };
   }
 
-  // Checks a saved seat for resume and the socket handshake.
+  // Checks a saved seat for resume and the socket handshake. A seat that left the game is still
+  // valid: binding it brings the player back.
   function checkSeat(rawCode, playerId, token) {
     const room = getRoom(rawCode);
     const player = typeof playerId === 'string' ? findPlayer(room, playerId) : null;
-    if (!player || player.left || !sameToken(player.token, token)) fail('BAD_SEAT', 'That seat is no longer yours');
+    if (!player || !tokenMatches(player.tokenHash, token)) fail('BAD_SEAT', 'That seat is no longer yours');
     return { room, player };
   }
 
   // A socket was bound to the seat. Returns reclaim requests refused because the seat came back.
+  // Binding a seat that left the game brings the player back into it.
   function connect(room, player, now) {
     player.sockets += 1;
     room.emptySince = null;
     room.lastActiveAt = now;
+    if (player.left) {
+      player.left = false;
+      ensureDeck(room); // they count for the next game again
+    }
     if (player.id === room.hostId) room.hostOfflineAt = null;
     const refused = room.reclaims.filter((r) => r.playerId === player.id);
     if (refused.length) room.reclaims = room.reclaims.filter((r) => r.playerId !== player.id);
@@ -366,13 +385,13 @@ function createRooms(options = {}) {
     return dropped;
   }
 
-  // Asks to take over an offline seat from a new device; the host approves or refuses.
+  // Asks to take over an offline seat (or one that left the game) from a new device; the host
+  // approves or refuses.
   function requestReclaim(rawCode, rawName, socketId, now) {
     const room = getRoom(rawCode);
     const name = cleanName(rawName);
     const player = room.players.find((p) => nameKey(p.name) === nameKey(name));
     if (!player) fail('BAD_SEAT', `Nobody called ${name} is in this room`);
-    if (player.left) fail('NAME_TAKEN', `${player.name} left this game`);
     if (player.sockets > 0) fail('NAME_TAKEN', `${player.name} is online on another device`);
     room.reclaims = room.reclaims.filter((r) => r.socketId !== socketId); // one request per device
     if (room.reclaims.length >= MAX_RECLAIMS) fail('NOT_ALLOWED', 'Too many takeover requests; try again in a minute');
@@ -405,28 +424,29 @@ function createRooms(options = {}) {
     const player = findPlayer(room, request.playerId);
     const refuse = (reason) => ({ request, granted: false, reason, others: [] });
     if (!allow) return refuse('The host said no');
-    if (!player || player.left) return refuse('That seat is gone');
+    if (!player) return refuse('That seat is gone');
     if (player.sockets > 0) return refuse(`${player.name} is back online`);
     if (!canDeliver(request.socketId)) return refuse('The device asking went offline');
-    player.token = newToken();
-    return { request, granted: true, player, token: player.token, others: dropReclaimsFor(room, player.id) };
+    const token = newToken();
+    player.tokenHash = hashToken(token);
+    return { request, granted: true, player, token, others: dropReclaimsFor(room, player.id) };
   }
 
-  // Lobby: the player is removed. In a game: marked as left but still in the game, token retired.
-  // A host who leaves hands host on at once. Returns { deleted, refused }.
+  // Lobby: the player is removed. In a game: the seat stays, marked left, and its token stays
+  // valid, so resuming brings the player back. A host who leaves hands host on at once.
+  // Returns { deleted, refused }; only an empty lobby is deleted.
   function leave(room, playerId, now) {
     const player = seated(room, playerId);
     player.ready = false;
     if (room.game) {
       player.left = true;
-      player.token = null;
       player.sockets = 0;
     } else {
       room.players = room.players.filter((p) => p !== player);
     }
     const refused = dropReclaimsFor(room, player.id);
     if (room.hostId === player.id) passHost(room, now);
-    if (!seatedPlayers(room).length) {
+    if (!room.players.length) {
       rooms.delete(room.code);
       return { deleted: true, refused };
     }
@@ -607,12 +627,63 @@ function createRooms(options = {}) {
       const nobody = !room.players.some((p) => p.sockets > 0);
       const empty = nobody && now - (room.emptySince ?? room.lastActiveAt) >= cleanupMs;
       const expired = now - room.createdAt >= ROOM_LIFETIME_MS;
-      if (empty || expired || !seatedPlayers(room).length) {
+      if (empty || expired || !room.players.length) {
         rooms.delete(room.code);
         removed.push({ room, reason: expired ? 'This room has expired' : 'This room was closed' });
       }
     }
     return removed;
+  }
+
+  // The persistent part of a room for the store: no socket counts, socket ids, timers, pending
+  // reclaims or lobby countdown. Seat tokens are only ever stored hashed.
+  function serializeRoom(room, now) {
+    return {
+      v: SNAPSHOT_VERSION,
+      savedAt: now,
+      room: {
+        code: room.code,
+        hostId: room.hostId,
+        players: room.players.map((p) => ({ id: p.id, name: p.name, tokenHash: p.tokenHash, ready: p.ready, left: p.left, joinedAt: p.joinedAt })),
+        settings: room.settings,
+        deck: room.deck,
+        deckPlayers: room.deckPlayers,
+        game: room.game,
+        createdAt: room.createdAt,
+      },
+    };
+  }
+
+  // Rebuilds a saved room after a restart: everyone offline, ready flags cleared, every game
+  // deadline moved by the downtime. Returns the room (now in the store) or null if unusable.
+  function restoreRoom(data, now) {
+    const r = data && data.v === SNAPSHOT_VERSION && isObject(data.room) ? data.room : null;
+    if (!r || typeof r.code !== 'string' || !CODE_RE.test(r.code) || !Array.isArray(r.players) || !r.players.length) return null;
+    if (rooms.has(r.code)) return rooms.get(r.code);
+    const room = {
+      code: r.code,
+      hostId: r.hostId,
+      players: r.players.map((p) => ({
+        id: String(p.id), name: String(p.name), tokenHash: String(p.tokenHash),
+        ready: false, sockets: 0, left: !!p.left, joinedAt: Number(p.joinedAt) || now,
+      })),
+      settings: { ...defaultSettings(), ...(isObject(r.settings) ? r.settings : {}) },
+      deck: isObject(r.deck) ? r.deck : null,
+      deckPlayers: Number(r.deckPlayers) || 0,
+      game: isObject(r.game) ? r.game : null,
+      countdownEndsAt: null,
+      reclaims: [],
+      createdAt: Number(r.createdAt) || now,
+      lastActiveAt: now,
+      emptySince: now,
+      hostOfflineAt: now,
+    };
+    if (room.game && !G) return null;
+    if (room.game) G.shiftDeadlines(room.game, now - (Number(data.savedAt) || now));
+    if (!room.players.some((p) => p.id === room.hostId)) room.hostId = (seatedPlayers(room)[0] || room.players[0]).id;
+    if (!room.deck) deal(room);
+    rooms.set(room.code, room);
+    return room;
   }
 
   return {
@@ -621,11 +692,11 @@ function createRooms(options = {}) {
     create, join, checkSeat, connect, disconnect,
     requestReclaim, cancelReclaims, approveReclaim,
     leave, kick, transferHost, setReady, updateSettings, shuffle, endGame, playAgain,
-    nextDeadline, onDeadline, roomView, sweep,
+    nextDeadline, onDeadline, roomView, sweep, serializeRoom, restoreRoom,
   };
 }
 
 module.exports = {
-  G, RoomError, createRooms, defaultSettings, mergeSettings, validateSetting, cleanName, normalizeCode,
-  CODE_ALPHABET, CODE_RE, COUNTDOWN_MS, HOST_GRACE_MS, CLEANUP_MS, ROOM_LIFETIME_MS, MAX_ROOMS,
+  G, RoomError, createRooms, defaultSettings, mergeSettings, validateSetting, cleanName, normalizeCode, hashToken,
+  SNAPSHOT_VERSION, CODE_ALPHABET, CODE_RE, COUNTDOWN_MS, HOST_GRACE_MS, CLEANUP_MS, ROOM_LIFETIME_MS, MAX_ROOMS,
 };

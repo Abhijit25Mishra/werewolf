@@ -109,6 +109,8 @@ function makeContext({ roles = {}, now = Date.now() } = {}) {
   add('kicked', 'Home', 'Kicked by the host', { snap: null, ui: { notice: { title: 'You were removed from the room', text: 'The host removed you from FANG. You can join again with the code.' } } });
   add('seat-invalid', 'Home', 'Saved seat no longer valid', { snap: null, ui: { notice: { title: 'That game has ended', text: 'Your saved seat is no longer in a room. Create a room or join one with its code.' } } });
   add('server-shutdown', 'Home', 'Server restarting', { snap: null, ui: { notice: { title: 'The server is restarting', text: 'The server is restarting; this game has ended. Create a new room in a minute.' } } });
+  add('home-left', 'Home', 'Rejoin after leaving a game', { snap: null, seat: { code: 'FANG', playerId: 'p3', token: 'x', name: 'Zoya', left: true }, ui: { home: { name: 'Zoya', code: '', errors: {} } } });
+  add('home-retry', 'Home', 'Server updating: retrying', { snap: null, ui: { home: { name: 'Meera', code: 'FANG', errors: {}, busy: 'join' }, retrying: true } });
   add('resuming', 'Home', 'Rejoining a saved seat', { snap: null, seat: { code: 'FANG', playerId: 'p1', token: 'x', name: 'Meera' }, ui: { resuming: true } });
 
   return { M, add, room, game, snap, ingame, nightTask, alive, others, wolfPack, deadDev, deadRohan, deadline, T, teamOf };
@@ -155,57 +157,61 @@ function defineReveal({ add, game, snap, ingame, deadline, wolfPack }) {
   add('reveal-host', 'Role reveal', 'Host can start night 1 early', { snap: snap(ingame({ you: 'p1' }), game({ you: 'p1', phase: 'reveal', reveal: rv(['p1', 'p2', 'p3', 'p5'], true), hostActions: ['start-night'], deadline: deadline(38, 'Night 1 starts') })) });
 }
 
-/* Night */
+/* Night: without Peek every role sees the same screen; the `-peek` mocks show the private panel. */
 function defineNight({ add, game, snap, ingame, nightTask, others, alive, wolfPack, deadDev, deadRohan, deadline }) {
   const night = (you, task, extra = {}) => snap(ingame({ you }), game({ you, phase: 'night', round: extra.round || 1, night: nightTask(task), deadline: deadline(extra.left ?? 71, 'Night ends'), ...extra }));
   const killTargets = (dead = {}) => alive(DEAL, dead).filter((id) => !['p2', 'p6'].includes(id));
+  const wolfTask = (o = {}) => ({ kind: 'wolf', prompt: 'Choose the pack’s victim', targets: killTargets(), wolf: { slot: 1, slots: 1, picks: {}, locked: [] }, ...o });
+  const seerTask = { kind: 'seer', prompt: 'Choose a player to inspect', targets: others('p3', DEAL) };
+  const seerDone = { ...seerTask, done: true, targets: [], submitted: { target: 'p6' }, result: { target: 'p6', wolf: true, text: 'Rohan is a werewolf' } };
+  const witchWaiting = { kind: 'witch', prompt: 'Wait while the pack chooses', targets: [], witch: { waiting: true, victims: [], canHeal: true, canPoison: true } };
+  const witchReady = { kind: 'witch', prompt: 'Use your potions tonight, or pass', targets: others('p5', DEAL), witch: { waiting: false, victims: ['p9'], canHeal: true, canPoison: true } };
+  const cupidTask = { kind: 'cupid', prompt: 'Choose two players to fall in love', targets: alive(DEAL), choose: 2 };
+  const doctorTask = { kind: 'doctor', prompt: 'Choose a player to protect tonight', targets: alive(DEAL, deadRohan).filter((id) => id !== 'p7') };
+  const decoyTask = { kind: 'decoy', prompt: 'Who do you suspect?', targets: others('p9', DEAL) };
+  const meetTask = { kind: 'meet', prompt: 'No kill tonight: meet your pack', targets: [] };
 
-  add('night-cupid', 'Night', 'Cupid links two lovers', { snap: night('p8', { kind: 'cupid', prompt: 'Choose two players to fall in love', targets: alive(DEAL), choose: 2 }), ui: { pick: ['p3', 'p5'] } });
-  add('night-wolf', 'Night', 'Werewolf picks a victim', {
-    snap: night('p2', { kind: 'wolf', prompt: 'Choose the pack’s victim', targets: killTargets(), wolf: { slot: 1, slots: 1, picks: { p2: 'p4', p6: 'p7' }, locked: [] }, submitted: { target: 'p4' } }, { known: { p6: 'werewolf' }, knows: wolfPack }),
-  });
-  add('night-wolf-peek', 'Night', 'Werewolf holds Peek: pack picks', {
-    snap: night('p2', { kind: 'wolf', prompt: 'Choose the pack’s victim', targets: killTargets(), wolf: { slot: 1, slots: 1, picks: { p2: 'p4', p6: 'p7' }, locked: [] }, submitted: { target: 'p4' } }, { known: { p6: 'werewolf' }, knows: wolfPack }),
-    ui: { sticky: { eye: true } },
-  });
-  add('night-wolf-two', 'Night', 'Wolf Cub bonus: second victim', {
-    snap: night('p2', { kind: 'wolf', prompt: 'Choose a second victim', targets: killTargets(deadDev).filter((id) => id !== 'p4'), wolf: { slot: 2, slots: 2, picks: { p2: 'p5' }, locked: ['p4'] } },
-      { round: 2, dead: deadDev, known: { p6: 'werewolf' }, knows: wolfPack }),
-    ui: { sticky: { eye: true } },
-  });
-  add('night-meet', 'Night', 'No kill on night 1: the pack meets', {
-    snap: night('p6', { kind: 'meet', prompt: 'Meet your pack', targets: [] }, { known: { p2: 'werewolf' }, knows: wolfPack }),
-    ui: { sticky: { eye: true } },
-  });
-  add('night-seer', 'Night', 'Seer chooses who to inspect', { snap: night('p3', { kind: 'seer', prompt: 'Choose a player to inspect', targets: others('p3', DEAL) }), ui: { pick: ['p6'] } });
-  const seerDone = { kind: 'seer', done: true, prompt: 'Choose a player to inspect', targets: [], submitted: { target: 'p6' }, result: { target: 'p6', wolf: true, text: 'Rohan is a werewolf' } };
-  add('night-seer-done', 'Night', 'Seer done, answer hidden', { snap: night('p3', seerDone, { marks: { p6: 'wolf' } }) });
-  add('night-seer-result', 'Night', 'Seer holds the answer', { snap: night('p3', seerDone, { marks: { p6: 'wolf' } }), ui: { sticky: { secret: true } } });
-  add('night-sorceress-result', 'Night', 'Sorceress holds the answer', {
-    snap: night('p9', { kind: 'sorceress', done: true, prompt: 'Choose a player to search', targets: [], submitted: { target: 'p3' }, result: { target: 'p3', seer: true, text: 'Zoya is the Seer' } },
+  // Pick stage: identical for every role.
+  add('night-seer', 'Night', 'Seer: shared pick screen', { snap: night('p3', seerTask), ui: { pick: ['p6'] } });
+  add('night-wolf', 'Night', 'Werewolf: shared pick screen', { snap: night('p2', wolfTask(), { known: { p6: 'werewolf' }, knows: wolfPack }), ui: { pick: ['p4'] } });
+  add('night-witch', 'Night', 'Witch: shared pick screen (camouflage)', { snap: night('p5', witchWaiting, { left: 58 }), ui: { pick: ['p2'] } });
+  add('night-cupid', 'Night', 'Cupid: shared pick screen (camouflage)', { snap: night('p8', cupidTask), ui: { pick: ['p4'] } });
+  add('night-doctor', 'Night', 'Doctor: shared pick screen', { snap: night('p4', doctorTask, { round: 2, dead: deadRohan, left: 64 }), ui: { pick: ['p5'] } });
+  add('night-decoy', 'Night', 'Villager: shared pick screen', { snap: night('p9', decoyTask), ui: { pick: ['p2'] } });
+  add('night-meet', 'Night', 'Pack meeting: shared pick screen', { snap: night('p6', meetTask, { known: { p2: 'werewolf' }, knows: wolfPack }), ui: { pick: ['p3'] } });
+  add('night-done', 'Night', 'Done. Waiting for the village', { snap: night('p9', { ...decoyTask, done: true, targets: [], submitted: { target: 'p2' } }, { left: 48 }) });
+
+  // Peek open: the private panel.
+  add('night-seer-peek', 'Night', 'Seer, Peek before confirming', { snap: night('p3', seerTask), ui: { pick: ['p6'], peekOpen: true } });
+  add('night-seer-result', 'Night', 'Seer, Peek: the answer', { snap: night('p3', seerDone, { marks: { p6: 'wolf' } }), ui: { peekOpen: true } });
+  add('night-sorceress-result', 'Night', 'Sorceress, Peek: the answer', {
+    snap: night('p9', { kind: 'sorceress', done: true, prompt: 'Choose a player to search for the Seer', targets: [], submitted: { target: 'p3' }, result: { target: 'p3', seer: true, text: 'Zoya is the Seer' } },
       { deal: { ...DEAL, p9: 'sorceress' }, marks: { p3: 'seer' } }),
-    ui: { sticky: { secret: true } },
+    ui: { peekOpen: true },
   });
-  add('night-doctor', 'Night', 'Doctor protects someone', {
-    snap: night('p4', { kind: 'doctor', prompt: 'Choose a player to protect tonight', targets: alive(DEAL, deadRohan).filter((id) => id !== 'p7') }, { round: 2, dead: deadRohan, left: 64 }),
-    ui: { pick: ['p4'] },
+  add('night-wolf-peek', 'Night', 'Werewolf, Peek: picks differ', {
+    snap: night('p2', wolfTask({ wolf: { slot: 1, slots: 1, picks: { p2: 'p4', p6: 'p7' }, locked: [] }, submitted: { target: 'p4' } }), { known: { p6: 'werewolf' }, knows: wolfPack }),
+    ui: { peekOpen: true },
   });
-  add('night-witch-waiting', 'Night', 'Witch waits for the pack', {
-    snap: night('p5', { kind: 'witch', prompt: 'Wait while the pack chooses', targets: [], witch: { waiting: true, victims: [], canHeal: true, canPoison: true } }, { left: 58 }),
+  add('night-wolf-two', 'Night', 'Werewolf, Peek: second victim', {
+    snap: night('p2', wolfTask({ prompt: 'Choose a second victim', targets: killTargets(deadDev).filter((id) => id !== 'p4'), wolf: { slot: 2, slots: 2, picks: { p6: 'p5' }, locked: ['p4'] }, submitted: { target: 'p4' } }),
+      { round: 2, dead: deadDev, known: { p6: 'werewolf' }, knows: wolfPack }),
+    ui: { peekOpen: true },
   });
-  const witchTask = { kind: 'witch', prompt: 'Use your potions', targets: others('p5', DEAL), witch: { waiting: false, victims: ['p9'], canHeal: true, canPoison: true } };
-  add('night-witch', 'Night', 'Witch chooses potions', { snap: night('p5', witchTask, { left: 33 }), ui: { witch: { heal: 'p9', poison: null } } });
-  add('night-witch-peek', 'Night', 'Witch holds Peek: the victim', { snap: night('p5', witchTask, { left: 29 }), ui: { sticky: { eye: true }, witchMode: 'poison', witch: { heal: 'p9', poison: 'p6' } } });
-  add('night-decoy', 'Night', 'Villager: who do you suspect?', { snap: night('p9', { kind: 'decoy', prompt: 'Who do you suspect?', targets: others('p9', DEAL) }), ui: { pick: ['p2'] } });
-  add('night-done', 'Night', 'Done. Waiting for the village', { snap: night('p9', { kind: 'decoy', done: true, prompt: 'Who do you suspect?', targets: [], submitted: { target: 'p2' } }, { left: 48 }) });
-  add('night-peek-marks', 'Night', 'Seer task with marks held', {
-    snap: night('p3', { kind: 'seer', prompt: 'Choose a player to inspect', targets: others('p3', DEAL, deadRohan).filter((id) => id !== 'p4') }, { round: 2, dead: deadRohan, marks: { p6: 'wolf', p4: 'notwolf' }, knows: { lover: { id: 'p5', sameTeam: true } } }),
-    ui: { sticky: { eye: true } },
+  add('night-meet-peek', 'Night', 'Pack meeting, Peek', { snap: night('p6', meetTask, { known: { p2: 'werewolf' }, knows: wolfPack }), ui: { pick: ['p3'], peekOpen: true } });
+  add('night-witch-waiting-peek', 'Night', 'Witch, Peek: pack still choosing', { snap: night('p5', witchWaiting, { left: 52 }), nightDone: true, ui: { peekOpen: true } });
+  add('night-witch-peek', 'Night', 'Witch, Peek: heal or poison', { snap: night('p5', witchReady, { left: 33 }), nightDone: true, ui: { peekOpen: true, witch: { heal: 'p9', poison: null } } });
+  add('night-cupid-peek', 'Night', 'Cupid, Peek: choose the Lovers', { snap: night('p8', cupidTask), nightDone: true, ui: { peekOpen: true, cupid: ['p3', 'p5'] } });
+  add('night-doctor-peek', 'Night', 'Doctor, Peek: not the same player again', { snap: night('p4', doctorTask, { round: 2, dead: deadRohan, left: 64 }), ui: { pick: ['p5'], peekOpen: true } });
+  add('night-decoy-peek', 'Night', 'Villager, Peek', { snap: night('p9', { ...decoyTask, done: true, targets: [], submitted: { target: 'p2' } }, { left: 46 }), ui: { peekOpen: true } });
+  add('night-peek-marks', 'Night', 'Seer, Peek with marks and notes', {
+    snap: night('p3', { ...seerTask, targets: others('p3', DEAL, deadRohan).filter((id) => id !== 'p4') }, { round: 2, dead: deadRohan, marks: { p6: 'wolf', p4: 'notwolf' }, notes: [{ round: 1, text: 'Rohan is a werewolf' }], knows: { lover: { id: 'p5', sameTeam: true } } }),
+    ui: { peekOpen: true },
   });
   add('night-ghost', 'Night', 'Ghost guesses the victim', {
     snap: snap(ingame({ you: 'p9' }), game({ you: 'p9', phase: 'night', round: 2, dead: deadDev, night: nightTask({ kind: 'ghost', prompt: 'Who will the wolves take tonight?', targets: alive(DEAL, deadDev) }), ghost: { guess: 'p4' }, deadline: deadline(66, 'Night ends') })),
   });
-  add('night-my-role', 'Night', 'Holding My role', { snap: night('p3', { kind: 'seer', prompt: 'Choose a player to inspect', targets: others('p3', DEAL) }, { notes: [] }), ui: { sticky: { myrole: true } } });
+  add('night-my-role', 'Night', 'Holding My role', { snap: night('p3', seerTask), ui: { sticky: { myrole: true } } });
 }
 
 /* Day: dawn, discussion, Hunter, vote, verdict */
@@ -243,7 +249,7 @@ function defineDay({ add, game, snap, ingame, alive, others, deadDev, deadRohan,
   });
   add('discussion-peek', 'Dawn and discussion', 'Seer holds Peek: marks', {
     snap: day('p3', 'discussion', { dead: deadRohan, marks: { p6: 'wolf', p2: 'wolf', p4: 'notwolf' }, notes: [{ round: 1, text: 'Rohan is a werewolf' }, { round: 2, text: 'Kabir is a werewolf' }] }),
-    ui: { sticky: { eye: true } },
+    ui: { peekOpen: true },
   });
   add('discussion-ghost', 'Dawn and discussion', 'Ghost during the day', { snap: day('p9', 'discussion', { round: 1 }) });
   add('discussion-no-timer', 'Dawn and discussion', 'Host ends the discussion', { snap: day('p4', 'discussion', { round: 1, left: null }) });
@@ -265,7 +271,7 @@ function defineDay({ add, game, snap, ingame, alive, others, deadDev, deadRohan,
   add('vote-live', 'Vote', 'Live voting', {
     snap: day('p3', 'vote', { round: 1, left: 37, label: 'Vote closes', dayx: { vote: vote({ voted: ['p1', 'p2', 'p4', 'p6', 'p8'], live: { p1: 'p6', p2: 'p4', p4: 'p6', p6: 'p4', p8: 'skip' } }) } }),
   });
-  add('vote-lover', 'Vote', 'Lover blocked, held Peek', { snap: day('p3', 'vote', { round: 1, left: 39, label: 'Vote closes', knows: { lover: { id: 'p5', sameTeam: true } }, dayx: { vote: vote({ blocked: ['p5'] }) } }), ui: { sticky: { eye: true } } });
+  add('vote-lover', 'Vote', 'Lover blocked, held Peek', { snap: day('p3', 'vote', { round: 1, left: 39, label: 'Vote closes', knows: { lover: { id: 'p5', sameTeam: true } }, dayx: { vote: vote({ blocked: ['p5'] }) } }), ui: { peekOpen: true } });
   add('vote-ghost', 'Vote', 'Ghost watches the vote', { snap: day('p9', 'vote', { round: 1, left: 35, label: 'Vote closes', dayx: { vote: vote({ canVote: false }) } }) });
   add('vote-host', 'Vote', 'Host: end vote', { snap: day('p1', 'vote', { round: 1, left: 28, label: 'Vote closes', host: ['end-vote', 'pause', 'extend'], dayx: { vote: vote({ myVote: 'p6', voted: ['p1', 'p2', 'p4', 'p6', 'p8'] }) } }) });
 
@@ -286,6 +292,7 @@ function defineDay({ add, game, snap, ingame, alive, others, deadDev, deadRohan,
   add('death-vote', 'Verdict', 'Death moment: voted out', { snap: day('p6', 'verdict', { round: 1, dead: deadRohan, left: 17, label: 'Night falls', known: { p2: 'werewolf' }, dayx: { vote: vote(), verdict: verdict() } }), ui: { death: 'vote' } });
   add('death-night', 'Dawn and discussion', 'Death moment: the wolves', { snap: day('p9', 'discussion', { round: 1 }), ui: { death: 'wolves' } });
   add('reconnecting', 'Dawn and discussion', 'Reconnecting banner', { snap: day('p3', 'discussion', { round: 1 }), banner: true });
+  add('restarting', 'Dawn and discussion', 'Server updating banner', { snap: day('p3', 'discussion', { round: 1 }), banner: true, restarting: true });
 }
 
 /* Game over, late arrival, sheets and dialogs */

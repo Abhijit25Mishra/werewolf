@@ -863,6 +863,17 @@ function nextDeadline(state) {
   return at.length ? Math.min(...at) : null;
 }
 
+// Moves every pending deadline, and the start of a pause, later by deltaMs: after a server
+// restart the downtime is given back, so each timer keeps the time it had left. Non-positive or
+// non-finite deltas change nothing.
+function shiftDeadlines(state, deltaMs) {
+  const dt = Math.round(Number(deltaMs));
+  if (!Number.isFinite(dt) || dt <= 0) return state;
+  for (const k of Object.keys(state.deadlines)) state.deadlines[k] += dt;
+  if (state.paused) state.paused.at += dt;
+  return state;
+}
+
 // ---------------------------------------------------------------- views
 
 // PLAN.md "Who sees whose role". `seeAll` is a dead viewer's deadSeeRoles view.
@@ -1019,5 +1030,5 @@ const trueRoles = (state) => Object.fromEntries(state.order.map((id) => [id, sta
 module.exports = {
   TIMERS, DEFAULT_SETTINGS, GameError,
   createGame, seenRole, nightAction, vote, shoot, hostAction, onDeadline,
-  nextDeadline, viewFor, inGame, isOver, trueRoles, aliveIds,
+  nextDeadline, shiftDeadlines, viewFor, inGame, isOver, trueRoles, aliveIds,
 };

@@ -7,3 +7,15 @@ services:
     startCommand: npm start
     healthCheckPath: /healthz
     autoDeployTrigger: commit
+    envVars:
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: werewolf-kv
+          property: connectionString
+  # Room snapshots and leases, so games survive restarts and deploys (docs/PROTOCOL.md).
+  - type: keyvalue
+    name: werewolf-kv
+    plan: free
+    ipAllowList: []
+    maxmemoryPolicy: allkeys-lru

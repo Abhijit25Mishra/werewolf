@@ -42,6 +42,11 @@ class Bot {
     });
     this.socket.on('seat:invalid', () => { this.seat = null; });
     this.socket.on('kicked', () => { this.kicked = true; });
+    // A restart or deploy: the server disconnects us on purpose, and Socket.IO doesn't
+    // reconnect by itself after that, so come back the way a phone would.
+    this.restarts = 0;
+    this.socket.on('server:restarting', (m) => { this.restarts++; this.reconnectSoon((m && m.reconnectInMs) || 1500); });
+    this.socket.on('disconnect', (reason) => { if (reason === 'io server disconnect') this.reconnectSoon(1500); });
     // Like a person glancing back at their phone: re-check now and then, even with no new
     // snapshot, so a declined roll or a RATE_LIMITED answer is retried instead of stalling.
     this.tick = setInterval(() => this.schedule(), 250);
@@ -67,6 +72,15 @@ class Bot {
     const r = await this.emit('room:join', { code, name: this.name });
     if (r.ok) this.seat = { code: r.code, playerId: r.playerId, token: r.token };
     return r;
+  }
+
+  reconnectSoon(ms) {
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(() => {
+      if (this.closed || this.socket.connected) return;
+      this.socket.connect();
+      this.reconnectSoon(Math.min(ms * 2, 5000)); // keep trying until a server answers
+    }, ms);
   }
 
   pick(list) { return list.length ? list[Math.floor(this.rng() * list.length)] : null; }
@@ -204,6 +218,7 @@ class Bot {
 
   close() {
     this.closed = true;
+    clearTimeout(this.reconnectTimer);
     clearInterval(this.tick);
     clearTimeout(this.timer);
     this.socket.close();
